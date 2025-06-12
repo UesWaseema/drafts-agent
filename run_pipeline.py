@@ -127,7 +127,6 @@ from agent_gemini_html import (
     html_output_sanitizer,
 )
 # 👇 NEW
-from quality_check_rules import run_quality_check
 from agent_qc_autofix import qc_autofix_agent, build_autofix_task
 from interspire_helpers import (
     get_recent_campaign_raw,          # NEW
@@ -140,6 +139,561 @@ import json # NEW
 
 from crewai import LLM # NEW
 LLM.provider = 'openrouter' # NEW
+
+# ────────────────────────────────────────────────────────────────────
+# 📌  QUALITY CHECK 2  – deterministic + AI  (after Auto-Fix)
+# ────────────────────────────────────────────────────────────────────
+from qc_script import validate as qc_det
+from qc_ai     import score    as qc_ai
+
+# ────────────────────────────────────────────────────────────────
+def step_generate_and_spam():
+    """Runs draft-writer ➜ initial spam removal."""
+    # --- compute waiver numbers FIRST ---------------------------------
+    waiver_level   = selected_journal["waiver_stance"] if selected_journal else "❌ Minimal"
+    last_waiver    = get_last_waiver_percentage(f"%{journal_short_name}%")
+    recommended_pct, waiver_msg = recommend_waiver(waiver_level, last_waiver)
+    # ------------------------------------------------------------------
+    start_ts = time.time()
+    with st.spinner("Generating your CFP draft... This may take a moment."):
+        # Construct the instructions string for the agent
+        instructions_content = f"""
+        Journal Name: {journal_name}
+        Short Name: {journal_short_name}
+        ISSN: {issn}
+        Impact Factor: {impact_factor}
+        Submission Deadline: {submission_deadline}
+        Fee Waiver: {'Yes' if waiver_available else 'No'}
+        Fee Waiver Percentage: {waiver_percentage if waiver_available else 'N/A'}
+        Fee Waiver Details: {fee_waiver_details if waiver_available else 'N/A'}
+        Domain: {domain}
+        Special Issue: {'Yes' if special_issue else 'No'}
+        Submit Paper URL: {submit_paper_url}
+        Other URL 1: {other_url_1}
+        Other URL 2: {other_url_2}
+        Sender Name: {sender_name}
+        Sender Email: {sender_email}
+        """
+        
+        if include_acceptance_rate and selected_journal and selected_journal['acceptance_rate'] is not None:
+            instructions_content += f"\nAcceptance Rate: {selected_journal['acceptance_rate']}"
+        
+        if include_volume_issue and selected_journal:
+            if selected_journal['volume'] is not None:
+                instructions_content += f"\nVolume: {selected_journal['volume']}"
+            if selected_journal['issue'] is not None:
+                instructions_content += f"\nIssue: {selected_journal['issue']}"
+
+        # Template selection based on draft_type
+        template_content = ""
+        if draft_type == "CFP":
+            templates = fetch_cfp_templates()
+        elif draft_type == "Open":
+            templates = fetch_open_templates()
+        
+        if not templates:
+            st.error(f"No templates found for {draft_type} type in the database.")
+            st.stop()
+        
+        template_content = random.choice(templates)
+        
+        instructions_content += f"\n\nUse the following template as a base for the email draft:\n\n{template_content}"
+
+        # ─── 1. fetch the last 10 campaigns ──────────────────────────────
+        pattern = f"%{journal_short_name}%"          # e.g. "%IJN%"
+        records  = get_recent_campaign_raw(pattern, limit=10)
+
+
+        # ─── 3. waiver analysis message  (unchanged) ─────────────────────
+        # waiver_level = selected_journal["waiver_stance"] if selected_journal else "❌ Minimal" # Moved up
+        # last_waiver  = get_last_waiver_percentage(journal_name) # Moved up
+        # _, waiver_text = recommend_waiver(waiver_level, last_waiver) # Moved up
+
+        # ========== BEGIN PATCH (replace the current DataFrame / JSON block) ==========
+        # Keep only the 3 columns we care about
+        keep_cols = ["subject", "email", "sent_date"]
+
+        trimmed_rows = [
+            {k: r.get(k) for k in keep_cols} for r in records
+        ]
+
+        df_recent = pd.DataFrame(trimmed_rows)
+
+        if not df_recent.empty:
+            recent_table = df_recent.to_markdown(index=False)
+            recent_json  = df_recent.to_json(
+                orient="records",
+                indent=2,
+                date_format="iso"
+            )
+        else:
+            recent_table = "*No recent rows found for this journal.*"
+            recent_json  = "[]"
+
+        latest_json = json.dumps(trimmed_rows[0] if trimmed_rows else {},
+                                 indent=2, default=str)
+        # ========== END PATCH =========================================================
+
+        metrics_block = f"""
+🧾 **Waiver Analysis**
+
+Last waiver offered : {last_waiver or 'N/A'} %  
+Journal stance      : {waiver_level}  
+Suggested now       : {recommended_pct}% ({waiver_msg})
+
+📈 **JSON export of the same 10 rows**  
+```json
+{recent_json}
+```
+
+📌 **Most-recent row only**
+```json
+{latest_json}
+```"""
+
+        # ─── Prompt-level debug (runs only after metrics_block exists) -----
+        if debug_mode:
+            with st.expander("📝 Debug: full prompt sent to LLM"):
+                st.code(metrics_block + instructions_content, language="markdown")
+
+            logger.info("[PROMPT] first row = %s", records[0] if records else None)
+            logger.info("[PROMPT] waiver=%s rec_pct=%s", last_waiver, recommended_pct)
+            logger.info("[PROMPT] prompt length = %s chars",
+                        len(metrics_block + instructions_content))
+
+        # ─── 6. splice it into full_instructions  ────────────────────────
+        full_instructions = (
+            f"Generate a CFP email for the {journal_name} ({journal_short_name}) "
+            f"focusing on {domain}. Highlight the journal's Impact Factor of "
+            f"{impact_factor} and mention the fee waiver details. "
+            "Ensure all required URLs and sender details are included as specified "
+            "in the system instructions.\n\n"
+
+            + instructions_content           # key-value list
+
+            + metrics_block                  # contains the JSON with 10 rows
+
+            + "\n\n"                         # <── NEW directive starts here
+            "### How to use the JSON above\n"
+            "1. Parse the `JSON export of the same 10 rows` section.\n"
+            "2. Notice the **subject**, **email** body, and **sent_date** for each entry.\n"
+            "3. Infer tone, length, and structure from those examples.\n"
+            "4. Write the new CFP draft in a **similar style**, but with fresh content.\n"
+            "5. Do **not** copy the old subjects verbatim—create new ones.\n"
+            + "\n\n"
+              "### Layout requirement – side-headings - HARD RULE.\n"
+              "Structure the email with clear **side-headings** so the reader can scan quickly. "
+              "Use bold formatting for each heading and keep each section concise.\n"
+            + "\n\n### Additional hard rules\n"
+              "- Use bold **creative side-headings**.\n"
+              "- Final draft must exceed **320 words**.\n"
+              "- Never output the placeholder text "
+              "\"[mention recipient's specific research area if known, otherwise keep general]\".\n"
+              "- Mention the full journal name only once in the intro and once in the signature.\n"
+              "- If waiver_available is No, do NOT add a sentence about fee waivers.\n"
+        )
+
+        # Build waiver popup
+        waiver_popup = ""
+        if waiver_available:
+            waiver_popup = (
+                "\n\n---\n"
+                "**📋 Waiver Review**\n"
+                f"Last waiver offered : {last_waiver or 'N/A'} %\n"
+                f"Journal stance      : {waiver_level}\n"
+                f"Suggested now      : {recommended_pct}% ({waiver_msg})\n"
+            )
+
+        # 5) Now, when you build your Task.description, just append `waiver_popup`:
+        task_description = f"""
+        {full_instructions}
+
+        {waiver_popup}
+        """
+
+        # ── OPTIONAL: inspect full prompt ──────────────────────────────
+        if show_full_prompt:
+            with st.expander("📝 Full prompt being sent to the LLM", expanded=False):
+                st.code(task_description, language="markdown")
+
+            # Offer a download
+            st.download_button(
+                label="💾 Download prompt.txt",
+                data=task_description,
+                file_name="prompt.txt",
+                mime="text/plain"
+            )
+
+        # Always log first 10k chars to console for quick grepping
+        logger.info("[PROMPT first 10k] %s …", task_description[:10_000])
+
+        total_tokens = n_tokens(task_description)
+        logger.info("[PROMPT tokens] %s", total_tokens)
+        if debug_mode:
+            st.caption(f"🧮 Prompt length: **{total_tokens:,} tokens**")
+
+        # ─── DEBUG guard rail ────────────────────────────────────────────
+        logger.info("[DEBUG] waiver_popup len=%s", len(waiver_popup))
+        logger.info("[DEBUG] full prompt tokens=%s", n_tokens(task_description))
+
+        if debug_mode:
+            st.caption(f"⚙️ Prompt tokens: {n_tokens(task_description):,}")
+            st.code(task_description[:1000] + "\n...\n", language="markdown")
+
+        # Bail early if prompt is clearly empty
+        if not waiver_popup.strip():
+            logger.warning("No waiver popup attached.")
+
+        try:
+            dynamic_draft_task = Task(
+                description=task_description,
+                agent=draft_writer_agent,
+                expected_output="A polished CFP draft with 10 subject lines, structured sections, clear tone, and full signature block.",
+                llm_options={"transform": "middle-out"}
+            )
+
+            crew = Crew(
+                agents=[draft_writer_agent],
+                tasks=[dynamic_draft_task],
+                verbose=False,
+                process=Process.sequential
+            )
+            result = crew.kickoff()
+            
+            # Process initial draft output
+            raw_output = result.raw if hasattr(result, 'raw') else str(result)
+            subject_lines, email_body_text = filter_agent_output(raw_output, include_subjects=True)
+
+            # ▸ Join the 10 subjects under a clear header
+            subjects_block = "Subject Lines:\n" + "\n".join(subject_lines)
+
+            # ▸ Combine with the email body
+            merged_draft_text = f"{subjects_block}\n\n{email_body_text}"
+
+            st.session_state.draft_prompt = task_description
+            st.session_state.draft_output = merged_draft_text.strip()
+
+            # Reset downstream state whenever a new draft is generated
+            for key in ("qc_prompt", "qc_output", "fix_prompt", "fix_output"):
+                st.session_state.pop(key, None)
+
+            save_run(
+                st.session_state.run_id,
+                draft_prompt=st.session_state.draft_prompt,
+                draft_output=st.session_state.draft_output,
+            )
+
+            # ▸ Keep both in session state
+            st.session_state.subject_lines = subject_lines
+            st.session_state.generated_draft = merged_draft_text.strip()
+
+            # Creative enhancement prompts
+            creative_prompts = [
+                "use a creative structure to the email, eye catching",
+                "use an appealing and creative structure that will keep the interest of the reader till the end",
+                "Craft a compelling piece with a unique structure that holds the reader's attention from start to finish.",
+                "Compose content that is eye-catching, creatively structured, and maintains momentum throughout.",
+                "Write with an inventive layout that is both aesthetically appealing and deeply engaging.",
+                "Design promotional material with an eye-grabbing layout and a storyline that holds attention."
+            ]
+
+            # Randomly select one creative prompt
+            selected_creative_prompt = random.choice(creative_prompts)
+
+            # Extract core content for rewriting (excluding subjects and signature)
+            # Use the newly parsed email_body_text as the original_draft_text for rewriting
+            original_draft_text = email_body_text
+            
+            rewrite_instructions = (
+                f"Rewrite the following email draft to be more stylistically compelling, "
+                f"maintaining the original tone and data. Focus on the following creative enhancement: "
+                f"'{selected_creative_prompt}'.\n\n"
+                f"Ensure the signature at the end of the draft follows this exact structure:\n"
+                f"    Warm Regards,\n"
+                f"    {sender_name}\n"
+                f"    Editorial Office\n"
+                f"    {journal_name}\n"
+                f"    616 Corporate Way, Suite 2-6158\n"
+                f"    Valley Cottage, NY 10989\n"
+                f"    United States\n"
+                f"    Email: {sender_email}\n\n"
+                f"Original Draft:\n{original_draft_text}"
+            )
+            
+            # Create a temporary task for rewriting
+            rewrite_task = Task(
+                description=(
+                    f"Rewrite the following email draft to be more stylistically compelling, "
+                    f"maintaining the original tone and data. Focus on the following creative enhancement: "
+                    f"'{selected_creative_prompt}'.\n\n"
+                    f"Adhere strictly to the following rules:\n"
+                    f"- Signature at the end of the draft must always follow this exact structure, ensuring each line is separated by a double newline (`\n\n`) for proper formatting:\n"
+                    f"    Warm Regards,\n\n"
+                    f"    {sender_name}\n\n"
+                    f"    Editorial Office\n\n"
+                    f"    {journal_name}\n\n"
+                    f"    616 Corporate Way, Suite 2-6158\n\n"
+                    f"    Valley Cottage, NY 10989\n\n"
+                    f"    United States\n\n"
+                    f"    Email: {sender_email}\n\n"
+                    f"Ensure all other paragraphs in the draft are also separated by double newlines (`\n\n`) for clear readability.\n\n"
+                    f"Original Draft:\n{original_draft_text}"
+                ),
+                agent=draft_writer_agent,
+                expected_output="A rewritten version of the provided email draft, adhering to the creative enhancement prompt, maintaining original tone and data, and including the specified signature structure.",
+                llm_options={"transform": "middle-out"}
+            )
+            
+            # Create a temporary crew for rewriting
+            rewrite_crew = Crew(
+                agents=[draft_writer_agent],
+                tasks=[rewrite_task],
+                verbose=False,
+                process=Process.sequential
+            )
+            
+            # Removed st.spinner("Enhancing draft...")
+            # Inputs are passed via task description, so no explicit inputs needed for kickoff here
+            enhanced_result = rewrite_crew.kickoff()
+            enhanced_draft_text = enhanced_result.raw if hasattr(enhanced_result, 'raw') else str(enhanced_result)
+            # Filter enhanced draft output to remove thoughts
+            _, enhanced_draft_text = filter_agent_output(enhanced_draft_text)
+
+            # Store generated draft and subject lines in session state
+            st.session_state.generated_draft = enhanced_draft_text.strip()
+            st.session_state.subject_lines = subject_lines
+            st.session_state.spam_checked_output = "" # Clear previous spam check output
+            st.session_state.replaced_spam_words = [] # New: Clear previous replaced spam words
+
+            # Perform initial spam check automatically
+            # First, identify spam words in the generated draft
+            # Call get_highlighted_text for highlighting (it returns only the text)
+            # The SPAM_WORDS list is now in common.py, so it needs to be imported or passed.
+            # For now, I'll assume it's imported.
+            from common import SPAM_WORDS
+            highlighted_text_for_initial_spam_check = get_highlighted_text(enhanced_draft_text.strip(), SPAM_WORDS)
+            
+            # Then, get the leftover spam words separately
+            found_spam_words_in_draft = get_leftover_spam_words(enhanced_draft_text.strip(), SPAM_WORDS)
+            st.session_state.replaced_spam_words = found_spam_words_in_draft # Store the words that will be replaced
+
+            # Create a dynamic spam removal task
+            dynamic_spam_removal_task = Task(
+                description=(
+                    f"Refine the following draft by removing or replacing spam words. "
+                    f"Draft to refine: {enhanced_draft_text.strip()}\n"
+                    f"Spam words to replace: {', '.join(found_spam_words_in_draft)}"
+                ),
+                agent=spam_removal_agent,
+                expected_output="A cleaned version of the email draft with all specified spam words removed or replaced.",
+                llm_options={"transform": "middle-out"}
+            )
+
+            spam_crew = Crew(
+                agents=[spam_removal_agent],
+                tasks=[dynamic_spam_removal_task],
+                verbose=False,
+                process=Process.sequential
+            )
+            
+            with st.spinner("Performing initial spam check and replacement..."):
+                try:
+                    spam_cleaned_result = spam_crew.kickoff()
+                    # Sanitize the agent's output to ensure only the refined draft is kept
+                    # Always convert the result to a string and then sanitize it
+                    raw_output = spam_cleaned_result.return_values['output'] if isinstance(spam_cleaned_result, AgentFinish) and 'output' in spam_cleaned_result.return_values else str(spam_cleaned_result)
+                    filtered_spam_output = final_output_sanitizer(raw_output)
+                    st.session_state.spam_checked_output = filtered_spam_output
+                    
+                    # Clear any QC leftovers
+                    for k in ("qc_prompt", "qc_output", "qc_passed",
+                            "fix_prompt", "fix_output",
+                            "qc2_report", "qc2_failed", "qc2_passed",
+                            "re_qc_done"):
+                        st.session_state.pop(k, None)
+                    
+                    # Store sidebar info for later QC use
+                    st.session_state.sidebar_info = {
+                        "journal_title": journal_name,
+                        "short_title": journal_short_name,
+                        "issn": issn,
+                        "impact_factor": impact_factor,
+                        "acceptance_rate": selected_journal.get("acceptance_rate", "") if selected_journal else "",
+                        "total_articles": selected_journal.get("total_articles", "")  if selected_journal else "",
+                        "apc_usd": selected_journal.get("apc_usd", "")               if selected_journal else "",
+                        "volume": selected_journal.get("volume", "")                 if selected_journal else "",
+                        "issue": selected_journal.get("issue", "")                  if selected_journal else "",
+                        "tier_classification": selected_journal.get("tier_classification", "") if selected_journal else "",
+                        "waiver_stance": waiver_stance,
+                        "journal_path": journal_path_suffix,
+                        "sender_full_name": sender_name,
+                    }
+                    
+                    # NEW ↓↓↓
+                    try:
+                        log_prompt_output(
+                            prompt_text=full_instructions,          # the master prompt you built
+                            output_text=filtered_spam_output,       # final cleaned draft
+                            draft_type=draft_type,                  # 'CFP' or 'Open'
+                            journal_title=journal_name,
+                            waiver_pct=waiver_percentage if waiver_available else None,
+                            model_name="gpt-4o-mini",               # or read from env
+                            latency_ms=int((time.time() - start_ts) * 1000),
+                            user_id=None                            # fill if you track logins
+                        )
+                    except Exception as db_err:
+                        st.error("⚠️ Could not write to prompt_logs table.")
+                        st.exception(db_err)
+                    # Initialize editable_draft_content with the spam-cleaned output
+                    st.session_state.editable_draft_content = st.session_state.spam_checked_output
+                except Exception as e:
+                    st.error(f"An error occurred during initial spam checking: {e}")
+                    st.info("Please check your API key, model name, and network connection.")
+                    st.exception(e)
+
+            # Display the final spam-checked draft directly (this will be replaced by components.html)
+            # st.markdown(st.session_state.spam_checked_output)
+            
+            # Calculate and display word count for the enhanced version
+            enhanced_core_word_count = calculate_core_word_count(st.session_state.generated_draft)
+            # The user's strict instruction "STRICTLY SHOW ONLY THE FINAL DRAFT" implies no word count or warnings.
+            # Removing these as well to adhere strictly to the instruction.
+            # st.write(f"**Content Word Count (excluding salutation and signature): {enhanced_core_word_count} words**")
+            # if enhanced_core_word_count < 400:
+            #     st.warning("Warning: The enhanced draft's core word count is below 400 words. Consider expanding the content.")
+            # elif enhanced_core_word_count > 600:
+            #     st.warning("Warning: The enhanced draft's core word count exceeds 600 words. Consider condensing the content.")
+            
+            # Add a guard so you never pass an empty string to the downstream steps:
+            if not email_body_text.strip():
+                st.error("⚠️ Draft came back empty. Enable debug_mode for details.")
+                st.stop()
+
+        except Exception as e:
+            st.error(f"An error occurred during draft generation: {e}")
+            st.info("Please check your API key, model name, and network connection.")
+            st.exception(e) # Added to show full traceback
+    st.session_state.generated = True
+    show_io(st.session_state.draft_prompt, st.session_state.draft_output, "Draft-Writer")
+# ---------------------------------------------------------------
+def step_qc_only():
+    """Runs deterministic + AI QC on the current draft (no fix)."""
+    if not st.session_state.get("draft_output"):
+        st.warning("Generate a draft first.")
+        return
+
+    draft_text = st.session_state.draft_output          # original draft
+    sidebar    = st.session_state.sidebar_info          # built in Generate step
+
+    # unified QC routine -------------------------------------------------
+    def run_full_qc(text: str) -> dict:
+        det = qc_det(text)
+        ai  = qc_ai(text) if det["__PASS__"] else {"__PASS__": False}
+        combo = {**det, **ai}
+        combo["__PASS__"] = det["__PASS__"] and ai["__PASS__"]
+        return combo
+    qc = run_full_qc(draft_text)
+    # -------------------------------------------------------------------
+
+    failed = [k for k, v in qc.items() if k not in ("__PASS__",) and v is False]
+
+    st.session_state.qc_prompt = "Full QC on current draft"
+    st.session_state.qc_output = "\n".join(
+        f"{'✅' if qc[r] else '❌'}  {r}" for r in qc if not r.startswith("__")
+    )
+    st.session_state.qc_passed = qc["__PASS__"]
+
+    show_io(st.session_state.qc_prompt, st.session_state.qc_output, "QC")
+
+    if qc["__PASS__"]:
+        st.success("🎉 Draft passed all QC checks!")
+    else:
+        st.error("🚨 Draft failed: " + ", ".join(failed))
+# ---------------------------------------------------------------
+def step_auto_fix():
+    """Runs auto-fix agent on last QC result."""
+    # build task + get untouched footer
+    autofix_task, frozen_footer = build_autofix_task(
+        draft_prompt       = st.session_state.draft_prompt,
+        original_draft       = st.session_state.draft_output,
+        quality_checklist  = st.session_state.qc_output,
+    )
+
+    autofix_crew = Crew(
+        agents=[qc_autofix_agent],
+        tasks=[autofix_task],
+        verbose=False,
+        process=Process.sequential,
+    )
+    autofix_body_raw = autofix_crew.kickoff()
+    raw_text = (
+        autofix_body_raw.output if hasattr(autofix_body_raw, "output")
+        else str(autofix_body_raw)
+    )
+
+    clean_text = final_output_sanitizer(raw_text)
+    fixed_text = clean_text + frozen_footer
+
+    st.session_state.fix_prompt = autofix_task.description
+    st.session_state.fix_output = fixed_text
+    st.session_state.editable_draft_content = fixed_text
+
+    save_run(
+        st.session_state.run_id,
+        fix_prompt=st.session_state.fix_prompt,
+        fix_output=st.session_state.fix_output,
+    )
+
+    st.success("✅ Autofix complete. Review below.")
+
+    if 'fix_output' in st.session_state:
+        st.session_state.history.append(
+            ("Original", st.session_state.draft_output,
+             "Corrected", st.session_state.fix_output)
+        )
+    st.session_state.fix_done = True
+    show_io(st.session_state.fix_prompt, st.session_state.fix_output, "Auto-Fix")
+# ---------------------------------------------------------------
+def step_qc_after_fix():
+    """Runs QC again on fixed draft; writes pass/fail report."""
+    fixed_text = st.session_state.fix_output # Access the fixed text from session state
+
+    # ────────────────────────────────────────────────────────────────────
+    # 📌  QUALITY CHECK 2  – deterministic + AI  (after Auto-Fix)
+    # ────────────────────────────────────────────────────────────────────
+    def run_full_qc(text: str) -> dict:
+        det = qc_det(text)
+        ai  = qc_ai(text) if det["__PASS__"] else {"__PASS__": False}  # skip LLM if rigid fail
+        combined = {**det, **ai}                                       # merge dicts
+        combined["__PASS__"] = det["__PASS__"] and ai["__PASS__"]
+        return combined
+
+    qc2 = run_full_qc(fixed_text)   # ← run on the final Auto-Fixed draft
+
+    # Format for UI
+    failed_rules = [k for k, v in qc2.items() if k not in ("__PASS__",) and v is False]
+
+    # ── save to session state so we can show later
+    st.session_state.qc2_report = qc2
+    st.session_state.qc2_failed = failed_rules
+    st.session_state.qc2_passed = qc2["__PASS__"]
+
+    # ── Log + immediate feedback ───────────────────────────────────────
+    if qc2["__PASS__"]:
+        st.success("🎉 Draft PASSED all deterministic + AI checks!")
+    else:
+        pass
+    st.session_state.re_qc_done = True
+    show_io(str(st.session_state.qc2_report), str(st.session_state.qc2_failed), "QC-After-Fix")
+# ────────────────────────────────────────────────────────────────
+
+def show_io(prompt_text: str, output_text: str, label: str):
+    with st.expander(f"🗂 {label} – prompt / output", expanded=False):
+        col_p, col_o = st.columns(2)
+        with col_p:
+            st.selectbox("Prompt", [prompt_text], index=0, label_visibility="collapsed")
+        with col_o:
+            st.selectbox("Output", [output_text], index=0, label_visibility="collapsed")
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="CFP Email Draft Generator", layout="wide")
@@ -360,576 +914,17 @@ with st.sidebar:
 if 'run_id' not in st.session_state:
     st.session_state.run_id = str(uuid.uuid4())
 
-if st.button("Generate Draft", type="primary"):
-    start_ts = time.time()
-    with st.spinner("Generating your CFP draft... This may take a moment."):
-        # Construct the instructions string for the agent
-        instructions_content = f"""
-        Journal Name: {journal_name}
-        Short Name: {journal_short_name}
-        ISSN: {issn}
-        Impact Factor: {impact_factor}
-        Submission Deadline: {submission_deadline}
-        Fee Waiver: {'Yes' if waiver_available else 'No'}
-        Fee Waiver Percentage: {waiver_percentage if waiver_available else 'N/A'}
-        Fee Waiver Details: {fee_waiver_details if waiver_available else 'N/A'}
-        Domain: {domain}
-        Special Issue: {'Yes' if special_issue else 'No'}
-        Submit Paper URL: {submit_paper_url}
-        Other URL 1: {other_url_1}
-        Other URL 2: {other_url_2}
-        Sender Name: {sender_name}
-        Sender Email: {sender_email}
-        """
-        
-        if include_acceptance_rate and selected_journal and selected_journal['acceptance_rate'] is not None:
-            instructions_content += f"\nAcceptance Rate: {selected_journal['acceptance_rate']}"
-        
-        if include_volume_issue and selected_journal:
-            if selected_journal['volume'] is not None:
-                instructions_content += f"\nVolume: {selected_journal['volume']}"
-            if selected_journal['issue'] is not None:
-                instructions_content += f"\nIssue: {selected_journal['issue']}"
-
-        # Template selection based on draft_type
-        template_content = ""
-        if draft_type == "CFP":
-            templates = fetch_cfp_templates()
-        elif draft_type == "Open":
-            templates = fetch_open_templates()
-        
-        if not templates:
-            st.error(f"No templates found for {draft_type} type in the database.")
-            st.stop()
-        
-        template_content = random.choice(templates)
-        
-        instructions_content += f"\n\nUse the following template as a base for the email draft:\n\n{template_content}"
-
-        # ─── 1. fetch the last 10 campaigns ──────────────────────────────
-        pattern = f"%{journal_short_name}%"          # e.g. "%IJN%"
-        records  = get_recent_campaign_raw(pattern, limit=10)
-
-
-        # ─── 3. waiver analysis message  (unchanged) ─────────────────────
-        # waiver_level = selected_journal["waiver_stance"] if selected_journal else "❌ Minimal" # Moved up
-        # last_waiver  = get_last_waiver_percentage(journal_name) # Moved up
-        # _, waiver_text = recommend_waiver(waiver_level, last_waiver) # Moved up
-
-        # ========== BEGIN PATCH (replace the current DataFrame / JSON block) ==========
-        # Keep only the 3 columns we care about
-        keep_cols = ["subject", "email", "sent_date"]
-
-        trimmed_rows = [
-            {k: r.get(k) for k in keep_cols} for r in records
-        ]
-
-        df_recent = pd.DataFrame(trimmed_rows)
-
-        if not df_recent.empty:
-            recent_table = df_recent.to_markdown(index=False)
-            recent_json  = df_recent.to_json(
-                orient="records",
-                indent=2,
-                date_format="iso"
-            )
-        else:
-            recent_table = "*No recent rows found for this journal.*"
-            recent_json  = "[]"
-
-        latest_json = json.dumps(trimmed_rows[0] if trimmed_rows else {},
-                                 indent=2, default=str)
-        # ========== END PATCH =========================================================
-
-        metrics_block = f"""
-🧾 **Waiver Analysis**
-
-Last waiver offered : {last_waiver or 'N/A'} %  
-Journal stance      : {waiver_level}  
-Suggested now       : {recommended_pct}% ({waiver_msg})
-
-📈 **JSON export of the same 10 rows**  
-```json
-{recent_json}
-```
-
-📌 **Most-recent row only**
-```json
-{latest_json}
-```"""
-
-        # ─── Prompt-level debug (runs only after metrics_block exists) -----
-        if debug_mode:
-            with st.expander("📝 Debug: full prompt sent to LLM"):
-                st.code(metrics_block + instructions_content, language="markdown")
-
-            logger.info("[PROMPT] first row = %s", records[0] if records else None)
-            logger.info("[PROMPT] waiver=%s rec_pct=%s", last_waiver, recommended_pct)
-            logger.info("[PROMPT] prompt length = %s chars",
-                        len(metrics_block + instructions_content))
-
-        # ─── 6. splice it into full_instructions  ────────────────────────
-        full_instructions = (
-            f"Generate a CFP email for the {journal_name} ({journal_short_name}) "
-            f"focusing on {domain}. Highlight the journal's Impact Factor of "
-            f"{impact_factor} and mention the fee waiver details. "
-            "Ensure all required URLs and sender details are included as specified "
-            "in the system instructions.\n\n"
-
-            + instructions_content           # key-value list
-
-            + metrics_block                  # contains the JSON with 10 rows
-
-            + "\n\n"                         # <── NEW directive starts here
-            "### How to use the JSON above\n"
-            "1. Parse the `JSON export of the same 10 rows` section.\n"
-            "2. Notice the **subject**, **email** body, and **sent_date** for each entry.\n"
-            "3. Infer tone, length, and structure from those examples.\n"
-            "4. Write the new CFP draft in a **similar style**, but with fresh content.\n"
-            "5. Do **not** copy the old subjects verbatim—create new ones.\n"
-            + "\n\n"
-              "### Layout requirement – side-headings - HARD RULE.\n"
-              "Structure the email with clear **side-headings** so the reader can scan quickly. "
-              "Use bold formatting for each heading and keep each section concise.\n"
-            + "\n\n### Additional hard rules\n"
-              "- Use bold **creative side-headings**.\n"
-              "- Final draft must exceed **320 words**.\n"
-              "- Never output the placeholder text "
-              "\"[mention recipient's specific research area if known, otherwise keep general]\".\n"
-              "- Mention the full journal name only once in the intro and once in the signature.\n"
-              "- If waiver_available is No, do NOT add a sentence about fee waivers.\n"
-        )
-
-        # 1) Fetch latest campaign record
-        latest = get_latest_campaign(pattern)          # returns a dict or None
-        last_pct = latest.get("waiver_percentage") if latest else None
-
-        # 2) Fetch journal stance
-        stance = selected_journal["waiver_stance"] if selected_journal else "❌ Minimal" # Ensure selected_journal is not None
-
-        # 3) Compute a recommended waiver
-        latest = get_latest_campaign(pattern)          # returns a dict or None
-        last_pct = latest.get("waiver_percentage") if latest else None
-
-        # 2) Fetch journal stance
-        stance = selected_journal["waiver_stance"] if selected_journal else "❌ Minimal" # Ensure selected_journal is not None
-
-        # 3) Compute a recommended waiver
-        recommended_pct, waive_msg = recommend_waiver(stance, last_pct)
-
-        # 4) Build the waiver-popup questions only when appropriate
-        waiver_popup = ""
-        if last_pct is not None or waiver_available:
-            # Determine which branch we're in:
-            if stance == "❌ Minimal":
-                if last_pct is not None:
-                    prompt = (
-                      f"The last campaign offered a {last_pct}% waiver, "
-                      "but this journal has a **Minimal** waiver stance (0–10%).\n"
-                      "I recommend offering **no waiver** this time. Do you still want to proceed with a waiver?\n"
-                      "1) Yes, offer a waiver anyway\n"
-                      "2) No waiver\n"
-                    )
-                else:
-                    prompt = (
-                      "This is a tier-3 journal with a **Minimal** waiver stance (0–10%) and no waiver was given last time.\n"
-                      "I recommend **no waiver**. Do you still want to proceed with a waiver?\n"
-                      "1) Yes, specify a waiver\n"
-                      "2) No waiver\n"
-                    )
-            else:
-                # For Targeted or Aggressive
-                if last_pct is not None:
-                    prompt = (
-                      f"The last campaign offered a {last_pct}% waiver. Based on the **{stance}** stance, "
-                      f"I recommend **{recommended_pct}%** this time. Would you like to:\n"
-                      "1) Use the recommended waiver\n"
-                      f"2) Specify a different waiver percentage (other than {recommended_pct}%)\n"
-                    )
-                else:
-                    prompt = (
-                      f"No waiver was given last time. Based on the **{stance}** stance, "
-                      f"I recommend **{recommended_pct}%** this time. Would you like to:\n"
-                      "1) Use the recommended waiver\n"
-                      "2) Specify a different waiver percentage\n"
-                    )
-
-            waiver_popup = (
-              "\n\n---\n"
-              "**📋 Waiver Review**\n" +
-              prompt +
-              "3) Add deadline/conditions for this waiver (if any): __%\n"
-            )
-
-        # 5) Now, when you build your Task.description, just append `waiver_popup`:
-        task_description = f"""
-        {full_instructions}
-
-        {waiver_popup}
-        """
-
-        # ── OPTIONAL: inspect full prompt ──────────────────────────────
-        if show_full_prompt:
-            with st.expander("📝 Full prompt being sent to the LLM", expanded=False):
-                st.code(task_description, language="markdown")
-
-            # Offer a download
-            st.download_button(
-                label="💾 Download prompt.txt",
-                data=task_description,
-                file_name="prompt.txt",
-                mime="text/plain"
-            )
-
-        # Always log first 10k chars to console for quick grepping
-        logger.info("[PROMPT first 10k] %s …", task_description[:10_000])
-
-        total_tokens = n_tokens(task_description)
-        logger.info("[PROMPT tokens] %s", total_tokens)
-        if debug_mode:
-            st.caption(f"🧮 Prompt length: **{total_tokens:,} tokens**")
-
-        # ─── DEBUG guard rail ────────────────────────────────────────────
-        logger.info("[DEBUG] waiver_popup len=%s", len(waiver_popup))
-        logger.info("[DEBUG] full prompt tokens=%s", n_tokens(task_description))
-
-        if debug_mode:
-            st.caption(f"⚙️ Prompt tokens: {n_tokens(task_description):,}")
-            st.code(task_description[:1000] + "\n...\n", language="markdown")
-
-        # Bail early if prompt is clearly empty
-        if not waiver_popup.strip():
-            logger.warning("No waiver popup attached.")
-
-        try:
-            dynamic_draft_task = Task(
-                description=task_description,
-                agent=draft_writer_agent,
-                expected_output="A polished CFP draft with 10 subject lines, structured sections, clear tone, and full signature block.",
-                llm_options={"transform": "middle-out"}
-            )
-
-            crew = Crew(
-                agents=[draft_writer_agent],
-                tasks=[dynamic_draft_task],
-                verbose=False,
-                process=Process.sequential
-            )
-            result = crew.kickoff()
-            
-            # Process initial draft output
-            raw_output = result.raw if hasattr(result, 'raw') else str(result)
-            subject_lines, email_body_text = filter_agent_output(raw_output, include_subjects=True)
-
-            # ▸ Join the 10 subjects under a clear header
-            subjects_block = "Subject Lines:\n" + "\n".join(subject_lines)
-
-            # ▸ Combine with the email body
-            merged_draft_text = f"{subjects_block}\n\n{email_body_text}"
-
-            st.session_state.draft_prompt = task_description
-            st.session_state.draft_output = merged_draft_text.strip()
-
-            # Reset downstream state whenever a new draft is generated
-            for key in ("qc_prompt", "qc_output", "fix_prompt", "fix_output"):
-                st.session_state.pop(key, None)
-
-            save_run(
-                st.session_state.run_id,
-                draft_prompt=st.session_state.draft_prompt,
-                draft_output=st.session_state.draft_output,
-            )
-
-            # ▸ Keep both in session state
-            st.session_state.subject_lines = subject_lines
-            st.session_state.generated_draft = merged_draft_text.strip()
-
-            # Creative enhancement prompts
-            creative_prompts = [
-                "use a creative structure to the email, eye catching",
-                "use an appealing and creative structure that will keep the interest of the reader till the end",
-                "Craft a compelling piece with a unique structure that holds the reader's attention from start to finish.",
-                "Compose content that is eye-catching, creatively structured, and maintains momentum throughout.",
-                "Write with an inventive layout that is both aesthetically appealing and deeply engaging.",
-                "Design promotional material with an eye-grabbing layout and a storyline that holds attention."
-            ]
-
-            # Randomly select one creative prompt
-            selected_creative_prompt = random.choice(creative_prompts)
-
-            # Extract core content for rewriting (excluding subjects and signature)
-            # Use the newly parsed email_body_text as the original_draft_text for rewriting
-            original_draft_text = email_body_text
-            
-            rewrite_instructions = (
-                f"Rewrite the following email draft to be more stylistically compelling, "
-                f"maintaining the original tone and data. Focus on the following creative enhancement: "
-                f"'{selected_creative_prompt}'.\n\n"
-                f"Ensure the signature at the end of the draft follows this exact structure:\n"
-                f"    Warm Regards,\n"
-                f"    {sender_name}\n"
-                f"    Editorial Office\n"
-                f"    {journal_name}\n"
-                f"    616 Corporate Way, Suite 2-6158\n"
-                f"    Valley Cottage, NY 10989\n"
-                f"    United States\n"
-                f"    Email: {sender_email}\n\n"
-                f"Original Draft:\n{original_draft_text}"
-            )
-            
-            # Create a temporary task for rewriting
-            rewrite_task = Task(
-                description=(
-                    f"Rewrite the following email draft to be more stylistically compelling, "
-                    f"maintaining the original tone and data. Focus on the following creative enhancement: "
-                    f"'{selected_creative_prompt}'.\n\n"
-                    f"Adhere strictly to the following rules:\n"
-                    f"- Signature at the end of the draft must always follow this exact structure, ensuring each line is separated by a double newline (`\n\n`) for proper formatting:\n"
-                    f"    Warm Regards,\n\n"
-                    f"    {sender_name}\n\n"
-                    f"    Editorial Office\n\n"
-                    f"    {journal_name}\n\n"
-                    f"    616 Corporate Way, Suite 2-6158\n\n"
-                    f"    Valley Cottage, NY 10989\n\n"
-                    f"    United States\n\n"
-                    f"    Email: {sender_email}\n\n"
-                    f"Ensure all other paragraphs in the draft are also separated by double newlines (`\n\n`) for clear readability.\n\n"
-                    f"Original Draft:\n{original_draft_text}"
-                ),
-                agent=draft_writer_agent,
-                expected_output="A rewritten version of the provided email draft, adhering to the creative enhancement prompt, maintaining original tone and data, and including the specified signature structure.",
-                llm_options={"transform": "middle-out"}
-            )
-            
-            # Create a temporary crew for rewriting
-            rewrite_crew = Crew(
-                agents=[draft_writer_agent],
-                tasks=[rewrite_task],
-                verbose=False,
-                process=Process.sequential
-            )
-            
-            # Removed st.spinner("Enhancing draft...")
-            # Inputs are passed via task description, so no explicit inputs needed for kickoff here
-            enhanced_result = rewrite_crew.kickoff()
-            enhanced_draft_text = enhanced_result.raw if hasattr(enhanced_result, 'raw') else str(enhanced_result)
-            # Filter enhanced draft output to remove thoughts
-            _, enhanced_draft_text = filter_agent_output(enhanced_draft_text)
-
-            # Store generated draft and subject lines in session state
-            st.session_state.generated_draft = enhanced_draft_text.strip()
-            st.session_state.subject_lines = subject_lines
-            st.session_state.spam_checked_output = "" # Clear previous spam check output
-            st.session_state.replaced_spam_words = [] # New: Clear previous replaced spam words
-
-            # Perform initial spam check automatically
-            # First, identify spam words in the generated draft
-            # Call get_highlighted_text for highlighting (it returns only the text)
-            # The SPAM_WORDS list is now in common.py, so it needs to be imported or passed.
-            # For now, I'll assume it's imported.
-            from common import SPAM_WORDS
-            highlighted_text_for_initial_spam_check = get_highlighted_text(enhanced_draft_text.strip(), SPAM_WORDS)
-            
-            # Then, get the leftover spam words separately
-            found_spam_words_in_draft = get_leftover_spam_words(enhanced_draft_text.strip(), SPAM_WORDS)
-            st.session_state.replaced_spam_words = found_spam_words_in_draft # Store the words that will be replaced
-
-            # Create a dynamic spam removal task
-            dynamic_spam_removal_task = Task(
-                description=(
-                    f"Refine the following draft by removing or replacing spam words. "
-                    f"Draft to refine: {enhanced_draft_text.strip()}\n"
-                    f"Spam words to replace: {', '.join(found_spam_words_in_draft)}"
-                ),
-                agent=spam_removal_agent,
-                expected_output="A cleaned version of the email draft with all specified spam words removed or replaced.",
-                llm_options={"transform": "middle-out"}
-            )
-
-            spam_crew = Crew(
-                agents=[spam_removal_agent],
-                tasks=[dynamic_spam_removal_task],
-                verbose=False,
-                process=Process.sequential
-            )
-            
-            with st.spinner("Performing initial spam check and replacement..."):
-                try:
-                    spam_cleaned_result = spam_crew.kickoff()
-                    # Sanitize the agent's output to ensure only the refined draft is kept
-                    # Always convert the result to a string and then sanitize it
-                    raw_output = spam_cleaned_result.return_values['output'] if isinstance(spam_cleaned_result, AgentFinish) and 'output' in spam_cleaned_result.return_values else str(spam_cleaned_result)
-                    filtered_spam_output = final_output_sanitizer(raw_output)
-                    st.session_state.spam_checked_output = filtered_spam_output
-                    # ── Build the info dict the checker needs ───────────────────────────
-                    # ── Build the sidebar-info dict the checker needs
-                    sidebar_info = {
-                        "journal_title": journal_name,
-                        "short_title": journal_short_name,
-                        "issn": issn,
-                        "impact_factor": impact_factor,
-                        "acceptance_rate": selected_journal.get("acceptance_rate", "") if selected_journal else "",
-                        "total_articles": selected_journal.get("total_articles", "")  if selected_journal else "",
-                        "apc_usd": selected_journal.get("apc_usd", "")               if selected_journal else "",
-                        "volume": selected_journal.get("volume", "")                 if selected_journal else "",
-                        "issue": selected_journal.get("issue", "")                  if selected_journal else "",
-                        "tier_classification": selected_journal.get("tier_classification", "") if selected_journal else "",
-                        "waiver_stance": waiver_stance,
-                        "journal_path": journal_path_suffix,
-                        "sender_full_name": sender_name,
-                    }
-                    st.session_state.sidebar_info = sidebar_info # Store sidebar_info in session state
-
-                    qc_report = run_quality_check(
-                        st.session_state.spam_checked_output,   # the post-spam draft
-                        sidebar_info
-                    )
-                    st.session_state.qc_report = qc_report     # keep for later use
-
-                    # ── Gate the pipeline if anything fails
-                    if not qc_report["passed"]:
-                        # 1. Format checklist as a string
-                        checklist_md = "\n".join(qc_report["checklist"])
-
-                        # 2. Run autofix agent
-                        # Build dynamic Task with full context
-                        autofix_task, draft_footer = build_autofix_task( # UN-PACK the tuple
-                            draft_prompt   = st.session_state.draft_prompt,
-                            original_draft = st.session_state.spam_checked_output, # Use the spam-checked draft
-                            quality_checklist = checklist_md,
-                        )
-
-                        autofix_crew = Crew(
-                            agents=[qc_autofix_agent],
-                            tasks=[autofix_task], # now a real Task object
-                            process=Process.sequential,
-                            verbose=False,
-                        )
-
-                        autofix_body_raw = autofix_crew.kickoff() # Get the CrewOutput object
-                        autofix_body_str = autofix_body_raw.output if hasattr(autofix_body_raw, "output") else str(autofix_body_raw) # Extract the string output
-                        fixed_text = autofix_body_str + draft_footer # put the footer back
-                        st.session_state.editable_draft_content = fixed_text
-                        st.success("✅ Draft was auto-corrected. Review remaining issues below.")
-
-                        st.error("🚫 Quality-check failed. See below and fix before proceeding.")
-                        for item in qc_report["checklist"]:
-                            st.write(item)
-                        st.markdown("---")
-                        st.warning("✏️ You can edit the draft below and click **♻️ Re-run Spam Removal** when ready.")
-                        # do NOT call st.stop() — let the rest of the UI render
-                    else:
-                        st.success("✅ Draft passed all QC checks")
-                    # NEW ↓↓↓
-                    try:
-                        log_prompt_output(
-                            prompt_text=full_instructions,          # the master prompt you built
-                            output_text=filtered_spam_output,       # final cleaned draft
-                            draft_type=draft_type,                  # 'CFP' or 'Open'
-                            journal_title=journal_name,
-                            waiver_pct=waiver_percentage if waiver_available else None,
-                            model_name="gpt-4o-mini",               # or read from env
-                            latency_ms=int((time.time() - start_ts) * 1000),
-                            user_id=None                            # fill if you track logins
-                        )
-                    except Exception as db_err:
-                        st.error("⚠️ Could not write to prompt_logs table.")
-                        st.exception(db_err)
-                    # Initialize editable_draft_content with the spam-cleaned output
-                    st.session_state.editable_draft_content = st.session_state.spam_checked_output
-                except Exception as e:
-                    st.error(f"An error occurred during initial spam checking: {e}")
-                    st.info("Please check your API key, model name, and network connection.")
-                    st.exception(e)
-
-            # Display the final spam-checked draft directly (this will be replaced by components.html)
-            # st.markdown(st.session_state.spam_checked_output)
-            
-            # Calculate and display word count for the enhanced version
-            enhanced_core_word_count = calculate_core_word_count(st.session_state.generated_draft)
-            # The user's strict instruction "STRICTLY SHOW ONLY THE FINAL DRAFT" implies no word count or warnings.
-            # Removing these as well to adhere strictly to the instruction.
-            # st.write(f"**Content Word Count (excluding salutation and signature): {enhanced_core_word_count} words**")
-            # if enhanced_core_word_count < 400:
-            #     st.warning("Warning: The enhanced draft's core word count is below 400 words. Consider expanding the content.")
-            # elif enhanced_core_word_count > 600:
-            #     st.warning("Warning: The enhanced draft's core word count exceeds 600 words. Consider condensing the content.")
-            
-            # Add a guard so you never pass an empty string to the downstream steps:
-            if not email_body_text.strip():
-                st.error("⚠️ Draft came back empty. Enable debug_mode for details.")
-                st.stop()
-
-        except Exception as e:
-            st.error(f"An error occurred during draft generation: {e}")
-            st.info("Please check your API key, model name, and network connection.")
-            st.exception(e) # Added to show full traceback
-
 if 'draft_prompt' in st.session_state:
     with st.expander("🪄 Draft-writer prompt / output", expanded=False):
         st.code(st.session_state.draft_prompt, language="markdown")
         st.code(st.session_state.draft_output, language="markdown")
 
-if st.session_state.get('draft_output'):
-    if st.button("🕵️ Run QC"):
-        # clear any previous fix before new QC
-        st.session_state.pop("fix_prompt", None)
-        st.session_state.pop("fix_output", None)
-        qc_prompt = "QC on draft below using rule list ...\n\n" + st.session_state.draft_output
-        qc_res    = run_quality_check(st.session_state.draft_output, st.session_state.sidebar_info)
-        st.session_state.qc_prompt = qc_prompt
-        st.session_state.qc_output = "\n".join(qc_res["checklist"])
-
-        save_run(
-            st.session_state.run_id,
-            qc_prompt=st.session_state.qc_prompt,
-            qc_output=st.session_state.qc_output,
-        )
-
-        st.session_state.qc_passed = qc_res["passed"]
-        st.write(st.session_state.qc_output)
 
 if 'qc_prompt' in st.session_state:
     with st.expander("🔍 QC prompt / output", expanded=False):
         st.code(st.session_state.qc_prompt, language="markdown")
         st.code(st.session_state.qc_output, language="markdown")
 
-if st.session_state.get('qc_output') and not st.session_state.get('fix_output'):
-    if st.button("🔧 Auto-Fix Draft"):
-        # build task + get untouched footer
-        autofix_task, frozen_footer = build_autofix_task(
-            draft_prompt       = st.session_state.draft_prompt,
-            original_draft     = st.session_state.draft_output,
-            quality_checklist  = st.session_state.qc_output,
-        )
-
-        autofix_crew = Crew(
-            agents=[qc_autofix_agent],
-            tasks=[autofix_task],
-            verbose=False,
-            process=Process.sequential, # Changed from "sequential" to Process.sequential
-        )
-        autofix_body_raw = autofix_crew.kickoff() # Get the CrewOutput object
-        autofix_body_str = autofix_body_raw.output if hasattr(autofix_body_raw, "output") else str(autofix_body_raw) # Extract the string output
-        fixed_text = autofix_body_str + frozen_footer # put the footer back
-
-        st.session_state.fix_prompt = autofix_task.description # Set fix_prompt to the dynamic task's description
-        st.session_state.fix_output = fixed_text
-        st.session_state.editable_draft_content = fixed_text
-
-        save_run(
-            st.session_state.run_id,
-            fix_prompt=st.session_state.fix_prompt,
-            fix_output=st.session_state.fix_output,
-        )
-
-        st.success("✅ Autofix complete. Review below.")
-
-        if 'fix_output' in st.session_state:
-            st.session_state.history.append(
-                ("Original", st.session_state.draft_output,
-                 "Corrected", st.session_state.fix_output)
-            )
 
 if 'fix_prompt' in st.session_state:
     with st.expander("🛠 Auto-Fix prompt / output", expanded=False):
@@ -971,53 +966,33 @@ with col2:
         unsafe_allow_html=True
     )
 
-# Buttons for actions
-col_buttons_1, col_buttons_2 = st.columns(2)
+# --- toolbar ----------------------------------------------------
+btn_cols = st.columns(4)
+with btn_cols[0]:
+    gen_clicked = st.button("▶  Generate Draft", key="btn_generate", type="primary")
+with btn_cols[1]:
+    qc_clicked  = st.button("🕵️  Run QC",         key="btn_qc",
+                            disabled=not st.session_state.get('generated_draft'))
+with btn_cols[2]:
+    fix_clicked = st.button("🔧  Auto-Fix",       key="btn_fix",
+                            disabled=not st.session_state.get('qc_output'))
+with btn_cols[3]:
+    re_qc_clicked = st.button("✅  QC After Fix", key="btn_re_qc",
+                              disabled=not st.session_state.get('fix_output'))
 
-with col_buttons_1:
-    if st.button("♻️ Re-run Spam Removal", type="secondary"):
-        # This will trigger a re-run of the script, and the components.html will re-render with updated highlighting
-        # based on the latest st.session_state.editable_draft_content
-        from common import SPAM_WORDS # Re-import SPAM_WORDS for this section
-        re_highlighted_text = get_highlighted_text(st.session_state.editable_draft_content, SPAM_WORDS)
-        st.session_state.highlighted_editable_draft = re_highlighted_text
-        st.session_state.leftover_spam_words_list = get_leftover_spam_words(st.session_state.editable_draft_content, SPAM_WORDS)
-        st.session_state.word_count = calculate_core_word_count(st.session_state.editable_draft_content)
-        st.rerun()
-
-with col_buttons_2:
-    if st.button("✅ Save Draft and Proceed to HTML", type="primary"):
-        with st.spinner("Converting draft to HTML..."):
-            dynamic_html_task = Task(
-                description=html_task_template.description.format(
-                    draft_to_convert = st.session_state.editable_draft_content
-                ),
-                agent=gemini_html_agent,
-                expected_output=html_task_template.expected_output,
-                llm_options={"temperature": 0.5, "top_p": 1.0},
-            )
-
-            html_crew = Crew(
-                agents=[gemini_html_agent],
-                tasks=[dynamic_html_task],
-                process=Process.sequential,
-                verbose=False,
-            )
-            html_result = html_crew.kickoff()
-
-            raw_html   = html_result.raw if hasattr(html_result, "raw") else str(html_result)
-            clean_html = html_output_sanitizer(raw_html)
-
-            # Store in session state
-            st.session_state.generated_html_code  = clean_html
-            st.session_state.rendered_html_output = clean_html
+# --- call the steps *after* we know which button was pressed ----
+if gen_clicked:   step_generate_and_spam()
+if qc_clicked:    step_qc_only()
+if fix_clicked:   step_auto_fix()
+if re_qc_clicked: step_qc_after_fix()
+            
 
 
 # Leftover Spam Words
 if 'leftover_spam_words_list' in st.session_state and st.session_state.leftover_spam_words_list:
     st.write("The spam words in this draft are: " + ", ".join(st.session_state.leftover_spam_words_list))
 elif 'leftover_spam_words_list' in st.session_state:
-    st.write("No spam words found in the draft.")
+            st.write("No spam words found in the draft.")
 
 # Word Counter
 core_text = extract_core_content(st.session_state.editable_draft_content)
@@ -1029,6 +1004,24 @@ elif word_count > 600:
     warn = "⚠️ Too long!"
 st.caption(f"📝 Core content: {word_count} words {warn}")
 
+if "qc2_report" in st.session_state:
+    with st.expander("🔍 Full QC results", expanded=False):
+        df_qc = (pd.DataFrame(
+                    [{"Rule": k, "Pass": "✅" if v else "❌"}
+                     for k, v in st.session_state.qc2_report.items()
+                     if not k.startswith("__")]
+                 ) .sort_values("Rule"))
+        st.table(df_qc)
+
+if st.session_state.get("re_qc_done"):
+    passed = st.session_state.qc2_passed
+    st.markdown("---")
+    st.header("🏁 Final QC Result")
+    if passed:
+        st.success("🎉 **All QC checks passed after auto-fix!**")
+    else:
+        pass
+
 if "qc_report" in st.session_state and st.session_state.qc_report:
     with st.expander("📝 QC report", expanded=False):
         if st.session_state.qc_report["passed"]:
@@ -1037,11 +1030,11 @@ if "qc_report" in st.session_state and st.session_state.qc_report:
             for item in st.session_state.qc_report["checklist"]:
                 st.write(item)
 
-# Display remaining issues after autofix, if any
-if "editable_draft_content" in st.session_state and "🛠 Remaining Issues" in st.session_state.editable_draft_content:
-    st.markdown("### 🛠 Remaining Issues")
-    remaining = st.session_state.editable_draft_content.split("🛠 Remaining Issues", 1)[-1].strip()
-    st.markdown(remaining)
+# # Display remaining issues after autofix, if any
+# if "editable_draft_content" in st.session_state and "🛠 Remaining Issues" in st.session_state.editable_draft_content:
+#     st.markdown("### 🛠 Remaining Issues")
+#     remaining = st.session_state.editable_draft_content.split("🛠 Remaining Issues", 1)[-1].strip()
+#     st.markdown(remaining)
 
 # HTML Output Section
 if st.session_state.generated_html_code:

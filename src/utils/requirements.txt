@@ -1,0 +1,18 @@
+# ───────────────────────── Core LLM / Crew ────────────────────────────
+crewai==0.35.8      # stable; compatible with our Agent / Task API
+litellm>=1.34.0      # wrapper for OpenRouter / OpenAI
+tiktoken>=0.5.2
+google-generativeai>=0.5.4      # ← NEW ── Gemini client
+
+# ───────────────────────── Web / UI layer ─────────────────────────────
+streamlit>=1.33
+pandas>=2.2
+
+# ───────────────────────── Database drivers ───────────────────────────
+mysql-connector-python>=8.4
+pymysql>=1.1          # MySQL fallback
+psycopg2-binary>=2.9  # Postgres option
+
+# ───────────────────────── Utilities ──────────────────────────────────
+python-dotenv>=1.0
+urllib3>=2.2          # urlparse relies on stdlib, but keep urllib3 pinned

@@ -1,0 +1,20 @@
+2025-05-28 01:23:15,744 - ERROR - Error connecting to database: 1045 (28000): Access denied for user 'admin_waseema'@'ds1.openaccesspub.org' (using password: NO)
+2025-05-28 01:23:15,745 - ERROR - Database connection test failed: 'NoneType' object has no attribute 'cursor'
+2025-05-28 01:24:36,905 - INFO - Successfully connected to the database.
+2025-05-28 01:24:36,906 - INFO - --- Starting daily data synchronization ---
+2025-05-28 01:24:36,906 - INFO - Successfully connected to the database.
+2025-05-28 01:24:36,909 - ERROR - Interspire sync failed: 'campaign_name'
+2025-05-28 01:24:36,909 - ERROR - Daily sync failed: 'campaign_name'
+2025-05-28 01:24:36,910 - INFO - Successfully connected to the database.
+2025-05-28 01:24:36,938 - INFO - Last sync timestamp updated in database.
+2025-05-28 01:32:47,000 - INFO - Successfully connected to the database.
+2025-05-28 01:32:47,001 - INFO - --- Starting daily data synchronization ---
+2025-05-28 01:32:47,001 - INFO - Successfully connected to the database.
+2025-05-28 01:32:47,672 - INFO - Successfully connected to the database.
+2025-05-28 01:32:50,477 - INFO - Inserted 25448 campaigns into interspire_data
+2025-05-28 01:32:50,483 - INFO - Interspire sync: 25448 campaigns processed
+2025-05-28 01:32:50,484 - INFO - Successfully connected to the database.
+2025-05-28 01:32:50,496 - ERROR - MailWizz sync failed: 'DatabaseSyncPipeline' object has no attribute 'mailwizz_field_mapping'
+2025-05-28 01:32:50,496 - ERROR - Daily sync failed: 'DatabaseSyncPipeline' object has no attribute 'mailwizz_field_mapping'
+2025-05-28 01:32:50,497 - INFO - Successfully connected to the database.
+2025-05-28 01:32:50,503 - INFO - Last sync timestamp updated in database.

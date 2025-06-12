@@ -40,3 +40,4 @@ def html_output_sanitizer(raw_html: str) -> str:
     if not html_lines and raw_html.strip().startswith('<'):
         return raw_html.strip()
     return '\n'.join(html_lines).strip()
+ 
