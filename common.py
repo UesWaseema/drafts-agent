@@ -41,7 +41,7 @@ def get_leftover_spam_words(text, spam_words):
 
 # --- Configuration for LLM ---
 os.environ["LITELLM_DEBUG"] = "False" # Set to False for production, True for debugging
-OPENROUTER_API_KEY = "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" # Replace with your actual key
+OPENROUTER_API_KEY = "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" # Replace with your actual key
 OPENROUTER_MODEL_NAME = "openrouter/google/gemini-2.5-flash-preview-05-20"
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
