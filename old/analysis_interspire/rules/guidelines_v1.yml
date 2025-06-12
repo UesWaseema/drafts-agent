@@ -1,0 +1,7 @@
+subject_length: "35-55"
+caps_percent: "10-20"
+punctuation_limit: 1
+intro_words: "<=40"
+html_bullets: "first_half_required"
+external_domains: "<=2"
+domain_alignment: "from_domain == return_path_domain"
