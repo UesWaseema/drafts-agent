@@ -1,0 +1,8 @@
+# —— build artefacts ——
+__pycache__/
+*.pyc
+*.pyo
+*.db
+# —— logs / temp ——
+*.log
+*.csv
