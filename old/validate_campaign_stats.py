@@ -1,7 +1,7 @@
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from crewai_agent.campaign_stats import get_interspire_campaign_stats
+from crewai_agent.old.campaign_stats import get_interspire_campaign_stats
 
 print("Testing get_interspire_campaign_stats...")
 stats = get_interspire_campaign_stats(limit=5)

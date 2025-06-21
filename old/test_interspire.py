@@ -1,4 +1,4 @@
-from campaign_stats import get_interspire_campaign_stats
+from crewai_agent.old.campaign_stats import get_interspire_campaign_stats
 
 campaigns = get_interspire_campaign_stats()
 

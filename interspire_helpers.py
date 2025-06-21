@@ -45,7 +45,11 @@ def get_recent_campaign_records(journal: str, limit: int = 10) -> list[dict]:
 
     return [dict(r) for r in rows]          # ← every column preserved
 
-def get_recent_campaign_raw(pattern: str, limit: int = 10) -> list[dict]:
+def get_recent_campaign_raw(
+    pattern: str,
+    domain: str,
+    limit: int = 10,
+) -> list[dict]:
     """
     Return the most-recent `limit` rows straight from interspire_data
     (no join, no 31-column analysis table).

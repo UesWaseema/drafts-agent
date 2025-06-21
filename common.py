@@ -10,6 +10,8 @@ from db import get_conn # Import get_conn from the new db.py
 from langchain_core.language_models.llms import BaseLLM
 from langchain_core.outputs import LLMResult
 from litellm import completion
+from pydantic import BaseModel,Field    # or BaseModel, Field
+
 
 # Set up logger for common.py
 logger = logging.getLogger(__name__)
@@ -39,18 +41,61 @@ def get_leftover_spam_words(text, spam_words):
             leftover_words.append(word)
     return leftover_words
 
+SALUTATION_RX = re.compile(r"^.*?[,:\-]\s*", re.I | re.S)  # up to first “Dear …,” line
+CLOSING_RX    = re.compile(r"\bwarm regards\b", re.I)
+
+def _slice_core_email(text: str) -> str:
+    """
+    Return everything AFTER the salutation placeholder
+    and BEFORE 'Warm regards'.
+    """
+    # Strip first salutation block
+    after_sal = SALUTATION_RX.sub("", text, count=1)
+
+    # Cut at 'Warm regards'
+    match = CLOSING_RX.search(after_sal)
+    if match:
+        after_sal = after_sal[:match.start()]
+
+    return after_sal.strip()
+
+def calc_spam_metrics(email_txt: str) -> dict:
+    """
+    → { words: int, spam_words: int, pct: float, spam_list: list[str], score: int }
+    """
+    core = _slice_core_email(email_txt)
+    words = re.findall(r"\b\w+\b", core)
+    word_count = len(words)
+
+    spam_hits = [w for w in words if w.lower() in SPAM_WORDS]
+    spam_count = len(spam_hits)
+    pct = (spam_count / word_count * 100) if word_count else 0.0
+
+    # map % → 1-5
+    if   pct <= 1:  points = 5
+    elif pct <= 2:  points = 4
+    elif pct <= 3:  points = 3
+    elif pct <= 5:  points = 2
+    else:           points = 1
+
+    return dict(
+        words        = word_count,
+        spam_words   = spam_count,
+        pct          = round(pct, 2),
+        spam_list    = spam_hits,
+        score        = points
+    )
+
 # --- Configuration for LLM ---
 os.environ["LITELLM_DEBUG"] = "False" # Set to False for production, True for debugging
-OPENROUTER_API_KEY = "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" # Replace with your actual key
-OPENROUTER_MODEL_NAME = "openrouter/google/gemini-2.5-flash-preview-05-20"
+OPENROUTER_API_KEY = "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" # Replace with your actual key
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
-# Define a custom LLM class that wraps litellm.completion
 class CustomLiteLLM(BaseLLM):
-    model: str = OPENROUTER_MODEL_NAME
-    api_key: str = OPENROUTER_API_KEY
-    base_url: str = OPENROUTER_API_BASE
+    model: str                               # ← declare it
     temperature: float = 0.7
+    api_key: str = Field(default=OPENROUTER_API_KEY)
+    base_url: str = Field(default=OPENROUTER_API_BASE)
 
     @property
     def _llm_type(self) -> str:
@@ -74,7 +119,8 @@ class CustomLiteLLM(BaseLLM):
                     messages=messages,
                     temperature=self.temperature,
                     custom_llm_provider="openrouter",
-                    caching=False # Bypass caching
+                    caching=False, # Bypass caching
+                    extra_body={ "mode": "thinking", "budget": 150000 }
                 )
                 
                 # Log OPENROUTER_REQUEST_ID if debug is enabled
@@ -96,12 +142,45 @@ class CustomLiteLLM(BaseLLM):
             "temperature": self.temperature,
         }
 
-# Instantiate the custom LLM
-openrouter_llm = CustomLiteLLM()
+def get_model_name(llm) -> str:
+    return getattr(llm, "model", llm._identifying_params.get("model", "unknown"))
+
+# --- Waiver-stance routing --------------------------------------------------
+STANCE_MODEL_MAP: dict[str, tuple[str, float]] = {
+    "minimal":   ("openrouter/google/gemini-2.5-pro-preview-05-06", 0.7),
+    "targeted":  ("openrouter/anthropic/claude-sonnet-4",     0.32),
+    "aggressive":("openrouter/openai/gpt-4.1-2025-04-14",     0.25),
+}
+
+def _clean_stance(raw: str) -> str:
+    """
+    Strip emoji / symbols and whitespace, then lowercase.
+    Examples:
+        "❌ Minimal"   -> "minimal"
+        "⚠️ Targeted"  -> "targeted"
+        "✅ Aggressive"-> "aggressive"
+    """
+    words = raw.split()          # splits on any whitespace
+    return words[-1].lower()     # grab last word, e.g. "Minimal"
+
+def get_llm_for_stance(waiver_stance: str) -> CustomLiteLLM:
+    key = _clean_stance(waiver_stance)
+    model, temp = STANCE_MODEL_MAP[key]
+    return CustomLiteLLM(model=model, temperature=temp)
+
+
+gpt4o_llm = CustomLiteLLM(               # mini GPT-4o used by HTML agent
+    model="openrouter/openai/gpt-4o-mini-2024-07-18",
+    temperature=0.0,
+)
+
+gpt4o_full_llm = CustomLiteLLM(             # Full-size GPT-4o released 2024-08-06, deterministic (T=0.0)
+    model="openrouter/openai/gpt-4o-2024-08-06",
+    temperature=0.0,
+)
 
 # Load environment variables
 load_dotenv()
-
 # --- Database Functions ---
 # --- Database Functions ---
 DATABASE_NAME = 'journal_data.db'

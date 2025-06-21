@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os
-from database_sync_pipeline import DatabaseSyncPipeline
+from crewai_agent.old.database_sync_pipeline import DatabaseSyncPipeline
 
 def main():
     print("🔧 DEBUGGING SYNC PIPELINE")

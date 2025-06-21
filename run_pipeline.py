@@ -1,48 +1,40 @@
-import streamlit as st
+import os
+import streamlit as st, math
 import random
-import streamlit.components.v1 as components  # Import components
-import logging, json, textwrap, pandas as pd # NEW
+import streamlit.components.v1 as components 
+import logging, json, textwrap, pandas as pd
+from itertools import count
 from crewai import Crew, Process, Task
-import uuid, mysql.connector, os # Added uuid, mysql.connector, os
-from contextlib import contextmanager # Added contextmanager
+import uuid
+from datetime import date, timedelta
+import random 
+import logging, qc_ai
+from qc_models import MODEL_LIST
+from statistics import fmean
+from db import log_prompt_output, log_agent_run, save_run, save_draft, get_conn, get_unique_scenarios_for_journal
+import time
+import tiktoken
+import json, re
 
-@contextmanager
-def draft_db_cursor():
-    conn = mysql.connector.connect(
-        host=os.getenv("DRAFTS_DB_HOST"),
-        user=os.getenv("DRAFTS_DB_USER"),
-        password=os.getenv("DRAFTS_DB_PASS"),
-        database=os.getenv("DRAFTS_DB_NAME"),
-    )
-    cur = conn.cursor()
-    try:
-        yield cur
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
+st.set_page_config(page_title="Draft Generator", layout="wide")
 
-def save_run(run_id, **cols):
-    keys, vals = zip(*cols.items())
-    placeholders = ", ".join(["%s"] * len(vals))
-    columns      = ", ".join(keys)
-    update_cols  = ", ".join([f"{k}=VALUES({k})" for k in keys])
-    sql = f"""
-        INSERT INTO draft_runs (run_id, {columns})
-        VALUES (%s, {placeholders})
-        ON DUPLICATE KEY UPDATE {update_cols};
-    """
-    with draft_db_cursor() as cur:
-        cur.execute(sql, (run_id, *vals))
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("qc_ai").setLevel(logging.DEBUG)
 
 # ── Token length helper ────────────────────────────────────────────
 try:
-    import tiktoken
     enc = tiktoken.get_encoding("cl100k_base")
     def n_tokens(txt: str) -> int:
         return len(enc.encode(txt))
-except ImportError:                                  # coarse fallback
+except ImportError:
     def n_tokens(txt: str) -> int: return max(1, len(txt) // 4)
+
+_io_counter = count()
+
+def readonly(label, value):
+    st.text_input(label, value, disabled=True)
+
 
 # ── Build metrics block without breaking context limit ────────────
 def make_metrics_block(rows: list[dict],
@@ -96,10 +88,63 @@ Edit
         block = draft_block(keep)
 
     return block, keep
-from langchain_core.agents import AgentFinish # Added for AgentFinish handling
-from statistics import fmean # Added
-from db import log_prompt_output
-import time
+
+
+# ------------------------------------------------------------------
+# >>> NEW – multillm_qcresults helper
+# ------------------------------------------------------------------
+
+MODEL_SHORT_TO_COL = {
+    "gpt-4.1-2025-04-14":       "gpt-4.1-2025-04-14",
+    "gpt-4o-2024-08-06":        "gpt-4o-2024-08-06",
+    "gemini-2.5-pro-preview-06-05": "gemini-2.5-pro-preview-06-05",
+    "deepseek-r1-0528":         "deepseek-r1-0528",
+    "o3-2025-04-16":            "o3-2025-04-16",
+}
+
+def _short_name(model_id: str) -> str:
+    """openai/gpt-4o-2024-08-06 → gpt-4o-2024-08-06"""
+    return model_id.split("/")[-1]
+
+def save_multillm_qc(draft_txt: str,
+                     qc_prompt: str,
+                     model_reports: dict[str, dict]) -> None:
+    """
+    Insert one consolidated bundle.
+    model_reports comes straight from qc_ai.score(..., return_models=True)
+    """
+    cols  = ["draft", "qc_prompt"]
+    vals  = [draft_txt, qc_prompt]
+
+    for mdl, rep in model_reports.items():
+        short = _short_name(mdl)
+        if short in MODEL_SHORT_TO_COL:
+            cols.append(f"`{MODEL_SHORT_TO_COL[short]}`")
+            vals.append(json.dumps(rep))
+    # any missing JSON columns will default to NULL
+
+    placeholders = ", ".join(["%s"] * len(vals))
+    col_list     = ", ".join(cols)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO multillm_qcresults ({col_list}) VALUES ({placeholders})",
+            tuple(vals)
+        )
+        conn.commit()
+# ------------------------------------------------------------------
+# <<< END NEW
+
+def _start_timer():
+    if not st.session_state.timer_running:
+        st.session_state.timer_running = True
+        st.session_state.timer_start_ts = time.time()
+
+def _pause_timer():
+    if st.session_state.timer_running:
+        now = time.time()
+        st.session_state.timer_elapsed_ms += int((now - st.session_state.timer_start_ts) * 1000)
+        st.session_state.timer_running = False
 
 # put this just after the other imports
 logging.basicConfig(level=logging.INFO)
@@ -117,24 +162,33 @@ from common import (
     fetch_cfp_templates,
     fetch_open_templates,
     recommend_waiver,
-    SPAM_WORDS
+    SPAM_WORDS,
+    calc_spam_metrics,
+    get_model_name # NEW
 )
-from agent_draft_writer import draft_writer_agent, draft_task
+from agent_draft_writer import create_draft_writer_agent, create_draft_task
 from agent_spam_removal import spam_removal_agent, spam_removal_task, final_output_sanitizer
 from agent_gemini_html import (
     gemini_html_agent,
-    html_task_template,
-    html_output_sanitizer,
+    convert_draft_to_html,
+    build_final_plaintext,
 )
+from agent_reminder_writer import (
+    create_reminder_writer_agent,
+    create_reminder_task,
+)
+from agent_scenario import (
+    groq_scenario_agent
+)
+
 # 👇 NEW
-from agent_qc_autofix import qc_autofix_agent, build_autofix_task
 from interspire_helpers import (
     get_recent_campaign_raw,          # NEW
     rows_to_json,
     get_last_waiver_percentage,
     get_latest_campaign, # NEW
 )
-import datetime # Added for rows_to_json
+import datetime as _dt # Added for stopwatch
 import json # NEW
 
 from crewai import LLM # NEW
@@ -143,12 +197,101 @@ LLM.provider = 'openrouter' # NEW
 # ────────────────────────────────────────────────────────────────────
 # 📌  QUALITY CHECK 2  – deterministic + AI  (after Auto-Fix)
 # ────────────────────────────────────────────────────────────────────
-from qc_script import validate as qc_det
-from qc_ai     import score    as qc_ai
+# from qc_script import validate as qc_det   # disable
+# import qc_ai # NEW
+
+
+def get_draft_run_pk(run_uuid: str) -> int:
+    """Convert draft_runs.run_id (uuid) → draft_runs.id (int)."""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM draft_runs WHERE run_id = %s LIMIT 1",
+            (run_uuid,)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(f"run_id {run_uuid} not found")
+        return row["id"] if isinstance(row, dict) else row[0]
+    
+# ────────────────────────────────────────────────────────────────────
+# 📌  HELPER: Spam-clean a draft
+# ────────────────────────────────────────────────────────────────────
+def step_spam_clean(draft: str) -> str:
+    found = get_leftover_spam_words(draft, SPAM_WORDS)
+    if not found:
+        return draft
+
+    description_text = f"""
+You are a silent processing agent. Do not explain anything.
+
+Replace the following spam words in the draft with context-appropriate synonyms: {', '.join(found)}.
+
+Draft:
+{draft}
+
+Only return the updated draft text. Nindo commentary. No metadata.
+"""
+
+    spam_task = Task(
+        name="Spam Cleanup Task",
+        description=description_text,
+        agent=spam_removal_agent,
+        expected_output="Spam-cleaned draft text with replacements applied",
+    )
+
+    crew = Crew(
+        agents=[spam_removal_agent],
+        tasks=[spam_task],
+        process=Process.sequential
+    )
+
+    result = crew.kickoff()
+    cleaned = final_output_sanitizer(str(result))
+
+    # ── NEW: compute spam metrics & persist score ────────────────
+    metrics = calc_spam_metrics(cleaned)
+    st.session_state.spam_metrics = metrics           # for banner display
+
+    save_run(                                          # updates same run_id
+        st.session_state.run_id,
+        spam_score = metrics["score"]                 # <- new column
+    )
+
+   # ── token bookkeeping ───────────────────────────────────────────
+    usage = getattr(result, "usage", {})
+    ptok  = usage.get("prompt_tokens", n_tokens(description_text))   # fallback
+    ctok  = usage.get("completion_tokens", n_tokens(str(result)))    # fallback
+
+    log_agent_run(
+       st.session_state.run_id,
+       "spam_cleanup",
+       spam_removal_agent.llm.model,
+       ptok,
+       ctok
+   )
+
+    push_banner(
+       "Spam Remover",
+       spam_removal_agent.llm.model,
+       getattr(spam_removal_agent.llm, "temperature", "?"),
+       ptok,
+       ctok
+   )
+   # ────────────────────────────────────────────────────────────────
+
+    return cleaned
+
 
 # ────────────────────────────────────────────────────────────────
 def step_generate_and_spam():
     """Runs draft-writer ➜ initial spam removal."""
+
+    debug_mode      = st.session_state.get("debug_mode", False)
+    show_full_prompt = st.session_state.get("show_full_prompt", False)
+    # Access the scenario manually selected or typed by the user
+    user_scenario = st.session_state.get("manual_scenario", "").strip()
+
+    
     # --- compute waiver numbers FIRST ---------------------------------
     waiver_level   = selected_journal["waiver_stance"] if selected_journal else "❌ Minimal"
     last_waiver    = get_last_waiver_percentage(f"%{journal_short_name}%")
@@ -162,6 +305,7 @@ def step_generate_and_spam():
         Short Name: {journal_short_name}
         ISSN: {issn}
         Impact Factor: {impact_factor}
+        Scenario Focus: {user_scenario or 'Not specified by user'}
         Submission Deadline: {submission_deadline}
         Fee Waiver: {'Yes' if waiver_available else 'No'}
         Fee Waiver Percentage: {waiver_percentage if waiver_available else 'N/A'}
@@ -201,7 +345,7 @@ def step_generate_and_spam():
 
         # ─── 1. fetch the last 10 campaigns ──────────────────────────────
         pattern = f"%{journal_short_name}%"          # e.g. "%IJN%"
-        records  = get_recent_campaign_raw(pattern, limit=10)
+        records  = get_recent_campaign_raw(pattern, domain=selected_domain_name, limit=10)
 
 
         # ─── 3. waiver analysis message  (unchanged) ─────────────────────
@@ -241,33 +385,39 @@ Last waiver offered : {last_waiver or 'N/A'} %
 Journal stance      : {waiver_level}  
 Suggested now       : {recommended_pct}% ({waiver_msg})
 
-📈 **JSON export of the same 10 rows**  
-```json
-{recent_json}
-```
+if draft_type == "CFP":
+        return (
+            waiver_md +
+            "\n📈 **JSON export of the same 10 rows**  \n```json\n"
+            f"{recent_json}\n```\n\n"
+            "📌 **Most-recent row only**\n```json\n"
+            f"{latest_json}\n```"
+        )
 
-📌 **Most-recent row only**
-```json
-{latest_json}
-```"""
+    # --- reminder / “Open” branch (single previous draft) -------------
+    return (
+        waiver_md +
+        "\n📌 **Previous CFP JSON (1 row)**\n```json\n"
+        f"{latest_json}\n```"
+    )"""
 
         # ─── Prompt-level debug (runs only after metrics_block exists) -----
-        if debug_mode:
-            with st.expander("📝 Debug: full prompt sent to LLM"):
-                st.code(metrics_block + instructions_content, language="markdown")
+        #if debug_mode:
+        #    with st.expander("📝 Debug: full prompt sent to LLM"):
+        #        st.code(metrics_block + instructions_content, language="markdown")
 
-            logger.info("[PROMPT] first row = %s", records[0] if records else None)
-            logger.info("[PROMPT] waiver=%s rec_pct=%s", last_waiver, recommended_pct)
-            logger.info("[PROMPT] prompt length = %s chars",
-                        len(metrics_block + instructions_content))
+        #    logger.info("[PROMPT] first row = %s", records[0] if records else None)
+        #    logger.info("[PROMPT] waiver=%s rec_pct=%s", last_waiver, recommended_pct)
+        #    logger.info("[PROMPT] prompt length = %s chars",
+        #                len(metrics_block + instructions_content))
 
         # ─── 6. splice it into full_instructions  ────────────────────────
         full_instructions = (
             f"Generate a CFP email for the {journal_name} ({journal_short_name}) "
-            f"focusing on {domain}. Highlight the journal's Impact Factor of "
-            f"{impact_factor} and mention the fee waiver details. "
-            "Ensure all required URLs and sender details are included as specified "
-            "in the system instructions.\n\n"
+            f"using {domain}. Highlight the journal's Impact Factor of {impact_factor} "
+            "and mention any fee-waiver details. Use a **creative, unique scenario and structure**, "
+            "and craft an **eye-catching, memorable opening paragraph** that immediately grabs attention. "
+            "Ensure all required URLs and sender details are included exactly as specified in the system instructions.\n\n"
 
             + instructions_content           # key-value list
 
@@ -281,6 +431,8 @@ Suggested now       : {recommended_pct}% ({waiver_msg})
             "4. Write the new CFP draft in a **similar style**, but with fresh content.\n"
             "5. Do **not** copy the old subjects verbatim—create new ones.\n"
             + "\n\n"
+            + "\n\n"
+            "### Scenario Intent\nUse the following as the user's intended purpose or theme for the draft:\n**{user_scenario}**\n"
               "### Layout requirement – side-headings - HARD RULE.\n"
               "Structure the email with clear **side-headings** so the reader can scan quickly. "
               "Use bold formatting for each heading and keep each section concise.\n"
@@ -311,58 +463,100 @@ Suggested now       : {recommended_pct}% ({waiver_msg})
         {waiver_popup}
         """
 
-        # ── OPTIONAL: inspect full prompt ──────────────────────────────
-        if show_full_prompt:
-            with st.expander("📝 Full prompt being sent to the LLM", expanded=False):
-                st.code(task_description, language="markdown")
-
-            # Offer a download
-            st.download_button(
-                label="💾 Download prompt.txt",
-                data=task_description,
-                file_name="prompt.txt",
-                mime="text/plain"
-            )
-
-        # Always log first 10k chars to console for quick grepping
-        logger.info("[PROMPT first 10k] %s …", task_description[:10_000])
-
-        total_tokens = n_tokens(task_description)
-        logger.info("[PROMPT tokens] %s", total_tokens)
-        if debug_mode:
-            st.caption(f"🧮 Prompt length: **{total_tokens:,} tokens**")
-
-        # ─── DEBUG guard rail ────────────────────────────────────────────
-        logger.info("[DEBUG] waiver_popup len=%s", len(waiver_popup))
-        logger.info("[DEBUG] full prompt tokens=%s", n_tokens(task_description))
-
-        if debug_mode:
-            st.caption(f"⚙️ Prompt tokens: {n_tokens(task_description):,}")
-            st.code(task_description[:1000] + "\n...\n", language="markdown")
-
-        # Bail early if prompt is clearly empty
-        if not waiver_popup.strip():
-            logger.warning("No waiver popup attached.")
-
         try:
-            dynamic_draft_task = Task(
-                description=task_description,
-                agent=draft_writer_agent,
-                expected_output="A polished CFP draft with 10 subject lines, structured sections, clear tone, and full signature block.",
-                llm_options={"transform": "middle-out"}
-            )
+            # ── Choose writer + task based on Draft Type ───────────────────
+            if draft_type == "Open":          # ⬅ radio button from sidebar
+                # 1) build a tiny meta-dict for the helper
+                journal_meta = {
+                    "full_title":  journal_name,
+                    "short_title": journal_short_name,
+                    "impact_factor": impact_factor,
+                    "deadline": submission_deadline,
+                    "waiver_flag": "Yes" if waiver_available else "No",
+                    "waiver_pct": waiver_percentage,
+                    "submit_url": submit_paper_url,
+                    "url1":  other_url_1,
+                    "url2":  other_url_2,
+                    "sender_name":  sender_name,
+                    "sender_email": sender_email,
+                    "domain": selected_domain_name,
+                }
+
+                # 2) writer & task for *reminder*
+                writer_agent = create_reminder_writer_agent(waiver_level)
+                dynamic_draft_task = create_reminder_task(
+                    agent         = writer_agent,
+                    waiver_stance = waiver_level,
+                    journal_meta  = journal_meta,
+                )
+
+            else:                            # regular CFP flow
+                writer_agent = create_draft_writer_agent(waiver_level)
+                dynamic_draft_task = create_draft_task(
+                    agent             = writer_agent,
+                    waiver_stance     = waiver_level,
+                    instructions_block= task_description,
+                )
+
+            final_prompt = dynamic_draft_task.description # NEW LINE
+
+            # ── OPTIONAL: inspect full prompt ──────────────────────────────
+            if show_full_prompt:
+                with st.expander("📝 Final prompt to LLM", expanded=False):
+                    st.code(final_prompt, language="markdown")
+
+                # Offer a download
+                st.download_button(
+                    label="💾 Download prompt.txt",
+                    data=task_description,
+                    file_name="prompt.txt",
+                    mime="text/plain"
+                )
+
+            # Always log first 10k chars to console for quick grepping
+            logger.info("[FINAL PROMPT first 1k]\n%s", final_prompt[:1000])
+
+            total_tokens = n_tokens(final_prompt)
+            logger.info("[PROMPT tokens] %s", total_tokens)
+            #if debug_mode:
+            #    st.caption(f"🧮 Prompt length: **{total_tokens:,} tokens**")
+
+            # ─── DEBUG guard rail ────────────────────────────────────────────
+            logger.info("[DEBUG] waiver_popup len=%s", len(waiver_popup))
+            logger.info("[DEBUG] full prompt tokens=%s", n_tokens(final_prompt))
+
+            #if debug_mode:
+            #    st.caption(f"⚙️ Prompt tokens: {n_tokens(final_prompt):,}")
+            #    st.code(final_prompt[:1000] + "\n...\n", language="markdown")
+
+            # Bail early if prompt is clearly empty
+            if not waiver_popup.strip():
+                logger.warning("No waiver popup attached.")
 
             crew = Crew(
-                agents=[draft_writer_agent],
+                agents=[writer_agent],
                 tasks=[dynamic_draft_task],
                 verbose=False,
                 process=Process.sequential
             )
             result = crew.kickoff()
+
+            # ---------- token bookkeeping ----------
+            usage = getattr(result, "usage", {})
+            ptok  = usage.get("prompt_tokens", n_tokens(final_prompt)) # CHANGED
+            ctok  = usage.get("completion_tokens", n_tokens(str(result)))
+            log_agent_run(st.session_state.run_id, "draft_writer",
+                          writer_agent.llm.model, ptok, ctok)
+            push_banner("Draft Writer", writer_agent.llm.model,
+            writer_agent.llm.temperature, ptok, ctok)
+
+        
+            # ---------------------------------------
             
             # Process initial draft output
             raw_output = result.raw if hasattr(result, 'raw') else str(result)
             subject_lines, email_body_text = filter_agent_output(raw_output, include_subjects=True)
+            st.session_state.email_body_txt = email_body_text.strip()   # ← NEW
 
             # ▸ Join the 10 subjects under a clear header
             subjects_block = "Subject Lines:\n" + "\n".join(subject_lines)
@@ -370,7 +564,7 @@ Suggested now       : {recommended_pct}% ({waiver_msg})
             # ▸ Combine with the email body
             merged_draft_text = f"{subjects_block}\n\n{email_body_text}"
 
-            st.session_state.draft_prompt = task_description
+            st.session_state.draft_prompt = final_prompt # CHANGED
             st.session_state.draft_output = merged_draft_text.strip()
 
             # Reset downstream state whenever a new draft is generated
@@ -379,9 +573,18 @@ Suggested now       : {recommended_pct}% ({waiver_msg})
 
             save_run(
                 st.session_state.run_id,
+                journal_shortname=selected_journal["short_title"],
+                domain=selected_domain_name,
+                campaign_name=campaign_name,
                 draft_prompt=st.session_state.draft_prompt,
                 draft_output=st.session_state.draft_output,
+                waiver_percentage  = waiver_percentage,          # ← NEW
+                waiver_deadline    = waiver_deadline,            # if you added this col
+                submission_deadline= final_deadline,             # if you added this col
+                draft_type        = draft_type,      # ← NEW
             )
+            # Set draft_pk after saving the run
+            st.session_state.draft_pk = get_draft_run_pk(st.session_state.run_id)
 
             # ▸ Keep both in session state
             st.session_state.subject_lines = subject_lines
@@ -408,53 +611,61 @@ Suggested now       : {recommended_pct}% ({waiver_msg})
                 f"Rewrite the following email draft to be more stylistically compelling, "
                 f"maintaining the original tone and data. Focus on the following creative enhancement: "
                 f"'{selected_creative_prompt}'.\n\n"
-                f"Ensure the signature at the end of the draft follows this exact structure:\n"
-                f"    Warm Regards,\n"
-                f"    {sender_name}\n"
-                f"    Editorial Office\n"
-                f"    {journal_name}\n"
-                f"    616 Corporate Way, Suite 2-6158\n"
-                f"    Valley Cottage, NY 10989\n"
-                f"    United States\n"
-                f"    Email: {sender_email}\n\n"
+                f"All original House Rules remain fully in force (ABSOLUTE OUTPUT restriction, URL format, word-count, replacement dictionary, forbidden vocabulary, etc.)."
                 f"Original Draft:\n{original_draft_text}"
             )
             
             # Create a temporary task for rewriting
-            rewrite_task = Task(
-                description=(
-                    f"Rewrite the following email draft to be more stylistically compelling, "
-                    f"maintaining the original tone and data. Focus on the following creative enhancement: "
-                    f"'{selected_creative_prompt}'.\n\n"
-                    f"Adhere strictly to the following rules:\n"
-                    f"- Signature at the end of the draft must always follow this exact structure, ensuring each line is separated by a double newline (`\n\n`) for proper formatting:\n"
-                    f"    Warm Regards,\n\n"
-                    f"    {sender_name}\n\n"
-                    f"    Editorial Office\n\n"
-                    f"    {journal_name}\n\n"
-                    f"    616 Corporate Way, Suite 2-6158\n\n"
-                    f"    Valley Cottage, NY 10989\n\n"
-                    f"    United States\n\n"
-                    f"    Email: {sender_email}\n\n"
-                    f"Ensure all other paragraphs in the draft are also separated by double newlines (`\n\n`) for clear readability.\n\n"
-                    f"Original Draft:\n{original_draft_text}"
-                ),
-                agent=draft_writer_agent,
-                expected_output="A rewritten version of the provided email draft, adhering to the creative enhancement prompt, maintaining original tone and data, and including the specified signature structure.",
-                llm_options={"transform": "middle-out"}
+            rewrite_task = create_draft_task(
+                agent               = writer_agent,   # same agent
+                waiver_stance       = waiver_level,   # "❌ Minimal", etc.
+                instructions_block = rewrite_instructions
             )
+
             
-            # Create a temporary crew for rewriting
             rewrite_crew = Crew(
-                agents=[draft_writer_agent],
-                tasks=[rewrite_task],
-                verbose=False,
-                process=Process.sequential
+                agents  = [writer_agent],
+                tasks   = [rewrite_task],
+                process = Process.sequential,
+                verbose = False
             )
-            
+
+            enhanced_raw   = rewrite_crew.kickoff()
+
+            clean_rewrite  = final_output_sanitizer(
+            enhanced_raw.raw if hasattr(enhanced_raw, "raw") else str(enhanced_raw)
+            )
+            subject_lines, enhanced_draft_text = filter_agent_output(
+            clean_rewrite, include_subjects=True
+            )
+
             # Removed st.spinner("Enhancing draft...")
             # Inputs are passed via task description, so no explicit inputs needed for kickoff here
-            enhanced_result = rewrite_crew.kickoff()
+            enhanced_result = enhanced_raw 
+
+            rewrite_prompt = rewrite_task.description # NEW LINE
+            rewrite_output = enhanced_result.raw if hasattr(enhanced_result, "raw") else str(enhanced_result) # NEW LINE
+            st.session_state.rewrite_output = rewrite_output          # >>> NEW
+
+            # ---------- token bookkeeping ----------
+            usage = getattr(enhanced_result, "usage", {})
+            ptok  = usage.get("prompt_tokens", n_tokens(rewrite_prompt)) # CHANGED
+            ctok  = usage.get("completion_tokens", n_tokens(rewrite_output)) # CHANGED
+            log_agent_run(st.session_state.run_id, "rewrite_restyle",
+                          writer_agent.llm.model, ptok, ctok)
+            push_banner("Re-writer", writer_agent.llm.model,
+            writer_agent.llm.temperature, ptok, ctok)
+
+        
+            # ---------------------------------------
+            
+            #show_io(rewrite_prompt, rewrite_output, "Rewrite-Agent") # NEW LINE
+            save_run( # NEW BLOCK
+                st.session_state.run_id,
+                rewrite_prompt = rewrite_prompt,
+                rewrite_output = rewrite_output,
+            ) # END NEW BLOCK
+
             enhanced_draft_text = enhanced_result.raw if hasattr(enhanced_result, 'raw') else str(enhanced_result)
             # Filter enhanced draft output to remove thoughts
             _, enhanced_draft_text = filter_agent_output(enhanced_draft_text)
@@ -465,44 +676,9 @@ Suggested now       : {recommended_pct}% ({waiver_msg})
             st.session_state.spam_checked_output = "" # Clear previous spam check output
             st.session_state.replaced_spam_words = [] # New: Clear previous replaced spam words
 
-            # Perform initial spam check automatically
-            # First, identify spam words in the generated draft
-            # Call get_highlighted_text for highlighting (it returns only the text)
-            # The SPAM_WORDS list is now in common.py, so it needs to be imported or passed.
-            # For now, I'll assume it's imported.
-            from common import SPAM_WORDS
-            highlighted_text_for_initial_spam_check = get_highlighted_text(enhanced_draft_text.strip(), SPAM_WORDS)
-            
-            # Then, get the leftover spam words separately
-            found_spam_words_in_draft = get_leftover_spam_words(enhanced_draft_text.strip(), SPAM_WORDS)
-            st.session_state.replaced_spam_words = found_spam_words_in_draft # Store the words that will be replaced
-
-            # Create a dynamic spam removal task
-            dynamic_spam_removal_task = Task(
-                description=(
-                    f"Refine the following draft by removing or replacing spam words. "
-                    f"Draft to refine: {enhanced_draft_text.strip()}\n"
-                    f"Spam words to replace: {', '.join(found_spam_words_in_draft)}"
-                ),
-                agent=spam_removal_agent,
-                expected_output="A cleaned version of the email draft with all specified spam words removed or replaced.",
-                llm_options={"transform": "middle-out"}
-            )
-
-            spam_crew = Crew(
-                agents=[spam_removal_agent],
-                tasks=[dynamic_spam_removal_task],
-                verbose=False,
-                process=Process.sequential
-            )
-            
             with st.spinner("Performing initial spam check and replacement..."):
                 try:
-                    spam_cleaned_result = spam_crew.kickoff()
-                    # Sanitize the agent's output to ensure only the refined draft is kept
-                    # Always convert the result to a string and then sanitize it
-                    raw_output = spam_cleaned_result.return_values['output'] if isinstance(spam_cleaned_result, AgentFinish) and 'output' in spam_cleaned_result.return_values else str(spam_cleaned_result)
-                    filtered_spam_output = final_output_sanitizer(raw_output)
+                    filtered_spam_output = step_spam_clean(enhanced_draft_text.strip())
                     st.session_state.spam_checked_output = filtered_spam_output
                     
                     # Clear any QC leftovers
@@ -537,7 +713,7 @@ Suggested now       : {recommended_pct}% ({waiver_msg})
                             draft_type=draft_type,                  # 'CFP' or 'Open'
                             journal_title=journal_name,
                             waiver_pct=waiver_percentage if waiver_available else None,
-                            model_name="gpt-4o-mini",               # or read from env
+                            model_name=writer_agent.llm.model,
                             latency_ms=int((time.time() - start_ts) * 1000),
                             user_id=None                            # fill if you track logins
                         )
@@ -573,154 +749,525 @@ Suggested now       : {recommended_pct}% ({waiver_msg})
             st.error(f"An error occurred during draft generation: {e}")
             st.info("Please check your API key, model name, and network connection.")
             st.exception(e) # Added to show full traceback
-    st.session_state.generated = True
-    show_io(st.session_state.draft_prompt, st.session_state.draft_output, "Draft-Writer")
+    if "draft_prompt" in st.session_state and "draft_output" in st.session_state:
+        st.session_state.generated = True
+        #show_io(st.session_state.draft_prompt, st.session_state.draft_output, "Draft-Writer")
+# >>> NEW AI-ONLY QC ROUTINE (paste here) <<<
 # ---------------------------------------------------------------
-def step_qc_only():
-    """Runs deterministic + AI QC on the current draft (no fix)."""
-    if not st.session_state.get("draft_output"):
+# def step_qc_draft():
+#     """Run one-shot AI QC on the current editable draft."""
+#     if not st.session_state.get("draft_output"):
+#         st.warning("Generate a draft first.")
+#         return
+#
+#     email_txt = st.session_state.get(
+#         "editable_draft_content",
+#         st.session_state.get("draft_output", "")
+#     ).strip()
+#     prompt = build_qc_prompt(email_txt, domain)
+#
+#     # 1) Show prompt immediately; response will be filled in later
+#     show_io(prompt, "(waiting…)", "QC-Agent")
+#
+#     # ▸ 2) call the checker LLM
+#     report = qc_ai.score(email_txt, domain=domain, prompt_override=prompt)
+#
+#     # ▸ 3) front-end: show raw JSON
+#     out_json = json.dumps(report, indent=2)
+#     show_io(prompt, out_json, "QC-Agent")
+#
+#     # ▸ 4) cache for later UI
+#     st.session_state.qc_prompt  = prompt
+#     st.session_state.qc_output  = out_json
+#     st.session_state.qc_passed  = report["__PASS__"]
+#
+#     # ▸ 5) persist in draft_runs
+#     save_run(
+#         st.session_state.run_id,
+#         qc_prompt = prompt,
+#         qc_output = out_json
+#     )
+#
+#     # ▸ 6) metric logging (optional but nice)
+#     prompt_tok = n_tokens(prompt)
+#     comp_tok   = n_tokens(out_json)
+#     log_agent_run(
+#         st.session_state.run_id,
+#         "qc_ai",
+#         qc_ai.MODEL,
+#         prompt_tok,
+#         comp_tok
+#     )
+#
+# # ▸ 7) quick banner feedback – now with reasons
+#     if report["__PASS__"]:
+#         st.success("🎉 Draft PASSED all QC checks!")
+#     else:
+#         comments = report.get("comments", {})
+#         if not comments:                     # fallback if model forgot comments
+#             comments = {k: "failed (no details)"
+#                         for k, ok in report.items()
+#                         if k != "__PASS__" and not ok}
+#
+#         lines = [f"**{rule}** — {comments.get(rule, 'failed')}"
+#                  for rule, ok in report.items()
+#                  if rule != "__PASS__" and not ok]
+#
+#         st.error("❌ QC failed:\n\n" + "\n".join(lines))
+# ---------------------------------------------------------------
+# def step_auto_fix():
+#     """Runs auto-fix agent on last QC result."""
+#     # build task + get untouched footer
+#     autofix_task, frozen_footer = build_autofix_task(
+#         draft_prompt        = st.session_state.draft_prompt,
+#         original_draft        = st.session_state.draft_output,
+#         quality_checklist  = st.session_state.qc_output,
+#     )
+#
+#     autofix_crew = Crew(
+#         agents=[qc_autofix_agent],
+#         tasks=[autofix_task],
+#         verbose=False,
+#         process=Process.sequential,
+#     )
+#     autofix_body_raw = autofix_crew.kickoff()
+#
+#     # ---------- token bookkeeping ----------
+#     usage = getattr(autofix_body_raw, "usage", {})
+#     ptok  = usage.get("prompt_tokens", n_tokens(autofix_task.description))
+#     ctok  = usage.get("completion_tokens", n_tokens(str(autofix_body_raw)))
+#     log_agent_run(st.session_state.run_id, "autofix",
+#                   qc_autofix_agent.llm.model, ptok, ctok)
+#    
+#     # ---------------------------------------
+#
+#     raw_text = (
+#         autofix_body_raw.output if hasattr(autofix_body_raw, "output")
+#         else str(autofix_body_raw)
+#     )
+#
+#     clean_text = final_output_sanitizer(raw_text)
+#     fixed_text = step_spam_clean(clean_text) + frozen_footer
+#
+#     st.session_state.fix_prompt = autofix_task.description
+#     st.session_state.fix_output = fixed_text
+#     st.session_state.editable_draft_content = fixed_text
+#
+#     save_run(
+#         st.session_state.run_id,
+#         fix_prompt=st.session_state.fix_prompt,
+#         fix_output=st.session_state.fix_output,
+#     )
+#
+#     st.success("✅ Autofix complete. Review below.")
+#
+#     if 'fix_output' in st.session_state:
+#         st.session_state.history.append(
+#             ("Original", st.session_state.draft_output,
+#              "Corrected", st.session_state.fix_output)
+#         )
+#     st.session_state.fix_done = True
+#     show_io(st.session_state.fix_prompt, st.session_state.fix_output, "Auto-Fix")
+# ---------------------------------------------------------------
+# def step_qc_after_fix():
+#     """Runs QC again on fixed draft; writes pass/fail report."""
+# # ⛔  old
+# # fixed_text = st.session_state.fix_output  # Access the fixed text from session state
+#
+# # ✅  new
+#     fixed_text = st.session_state.editable_draft_content.strip()
+#
+#     # ────────────────────────────────────────────────────────────────────
+#     # 📌  QUALITY CHECK 2  – deterministic + AI  (after Auto-Fix)
+#     # ────────────────────────────────────────────────────────────────────
+#     def run_full_qc(text: str) -> dict:
+#         ai = qc_ai.score(text, domain=domain)      # single-layer QC
+#
+#         # approximate token bookkeeping (optional)
+#         prompt_tok = n_tokens(qc_ai.PROMPT_TEMPLATE.format(email=text))
+#         comp_tok   = prompt_tok
+#         log_agent_run(
+#             st.session_state.run_id, "qc_ai",
+#             os.getenv("QC_AI_MODEL", "gpt-4o-2024-08-06"),
+#             prompt_tok, comp_tok
+#         )
+#         return ai
+#     qc2 = run_full_qc(fixed_text)   # ← run on the final Auto-Fixed draft
+#
+#     # Format for UI
+#     failed_rules = [k for k, v in qc2.items() if k not in ("__PASS__",) and v is False]
+#
+#     # ── save to session state so we can show later
+#     st.session_state.qc2_report = qc2
+#     st.session_state.qc2_failed = failed_rules
+#     st.session_state.qc2_passed = qc2["__PASS__"]
+#
+#     # ── Log + immediate feedback ───────────────────────────────────────
+#     if qc2["__PASS__"]:
+#         st.success("🎉 Draft PASSED all deterministic + AI checks!")
+#     else:
+#         pass
+#     st.session_state.re_qc_done = True
+#
+#     save_run(
+#         st.session_state.run_id,
+#         qc2_prompt="Full QC after auto-fix",
+#         qc2_output=str(qc2)
+#     )
+#
+#     show_io(str(st.session_state.qc2_report), str(st.session_state.qc2_failed), "QC-After-Fix")
+# ────────────────────────────────────────────────────────────────
+
+# ───────────────────────────────────────────────────────────────
+# 💾 SAVE & HTML CONVERSION
+# ───────────────────────────────────────────────────────────────
+def step_save_and_html() -> None:
+    """
+    Uses the CURRENT editor text (editable_draft_content) as the
+    single source of truth, converts it to HTML, and saves both
+    plain-text and HTML to the database.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Get the up-to-date body text (user may have edited it)
+    # ------------------------------------------------------------------
+    draft_txt = st.session_state.get("editable_draft_content", "").strip()
+
+    if not draft_txt:
+        st.warning("Nothing to save/convert – draft is empty.")
+        return
+
+    # Keep legacy key in-sync for any other code that still reads it
+    st.session_state.email_body_txt = draft_txt
+
+    # ------------------------------------------------------------------
+    # 2. Wrap / clean for plain-text storage
+    # ------------------------------------------------------------------
+    final_plain_txt = build_final_plaintext(
+        body_txt    = draft_txt,
+        domain_code = st.session_state.domain_code,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Upsert into draft_runs (plain-text version)
+    # ------------------------------------------------------------------
+    save_run(
+        st.session_state.run_id,
+        final_draft = final_plain_txt,
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Send to **HTML agent**
+    # ------------------------------------------------------------------
+    html_code, usage = convert_draft_to_html(
+        plain_email       = draft_txt,                         # ← NEW
+        domain_code       = st.session_state.domain_code,
+        journal_shortname = st.session_state.journal_shortname,
+        domain_term       = st.session_state.domain_term,
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Insert / update row in drafts table
+    # ------------------------------------------------------------------
+    if "draft_id" not in st.session_state:
+        draft_id = save_draft(
+            draft_run_id  = st.session_state.draft_pk,
+            subject_lines = st.session_state.subject_lines,
+            html_body     = html_code,
+            text_body     = final_plain_txt,
+        )
+        st.session_state.draft_id = draft_id
+    else:
+        save_draft(
+            draft_id      = st.session_state.draft_id,
+            draft_run_id  = st.session_state.draft_pk,
+            subject_lines = st.session_state.subject_lines,
+            html_body     = html_code,
+            text_body     = final_plain_txt,
+            update=True,
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Logging / banners
+    # ------------------------------------------------------------------
+    ptok = usage.get("prompt_tokens", n_tokens(draft_txt))
+    ctok = usage.get("completion_tokens", n_tokens(html_code))
+
+    log_agent_run(
+        st.session_state.run_id, "html_convert",
+        gemini_html_agent.llm.model, ptok, ctok
+    )
+    push_banner(
+        "HTML Converter", gemini_html_agent.llm.model,
+        gemini_html_agent.llm.temperature, ptok, ctok
+    )
+
+    save_run(st.session_state.run_id, html_code=html_code)
+
+    # ------------------------------------------------------------------
+    # 7. Preview in UI
+    # ------------------------------------------------------------------
+    st.session_state.generated_html_code  = html_code
+    st.session_state.rendered_html_output = html_code
+    st.success("✅ Draft saved and converted to HTML (latest edits included).")
+
+def show_io(prompt_text: str, output_text: str, label: str):
+    """Side-by-side prompt / output viewer with unique widget keys."""
+    idx = next(_io_counter) # 0, 1, 2, …
+
+    with st.expander(f"🗂 {label} – prompt / output", expanded=False):
+        col_p, col_o = st.columns(2)
+
+        with col_p:
+            st.selectbox(
+                "Prompt",
+                [prompt_text],
+                index=0,
+                label_visibility="collapsed",
+                key=f"{label}_prompt_{idx}" # ← unique
+            )
+
+        with col_o:
+            st.selectbox(
+                "Output",
+                [output_text],
+                index=0,
+                label_visibility="collapsed",
+                key=f"{label}_output_{idx}" # ← unique
+        )
+
+# ─────────────────────────────────────────────────────────────
+# QC 2.0  – lean wrapper around qc_ai.score()
+# ─────────────────────────────────────────────────────────────
+import qc_ai, json                           # NEW
+import qc_helper            # 👈 make sure helper is imported
+# from common import n_tokens                  # already present
+from db import save_run, log_agent_run       # already present
+
+def _build_qc_prompt(email_txt: str) -> str:
+    """Fill qc_ai's template and return the final mega-prompt."""
+    return (
+        qc_ai.PROMPT_TEMPLATE
+             .replace("<DOMAIN_PLACEHOLDER>", domain)   # global `domain`
+             .format(email=email_txt)
+    )
+
+def _render_cached_qc() -> None:
+    """Show the last QC result if present in session_state."""
+    if not st.session_state.get("qc_output"):
+        return
+
+    summary = json.loads(st.session_state.qc_output)
+    with st.expander("🔍 QC summary", expanded=False):
+        if summary["__PASS__"]:
+            st.success("✅ Passed all checks")
+        else:
+            st.error("❌ Failed checks")
+        st.json(summary, expanded=True)
+
+def _render_cached_qc2() -> None:
+    if not st.session_state.get("qc2_output"):
+        return
+    summary = json.loads(st.session_state.qc2_output)
+    with st.expander("🔍 2nd QC summary", expanded=False):
+        if summary.get("__PASS__"):
+            st.success("✅ Passed all checks")
+        else:
+            st.error("❌ Failed checks")
+        st.json(summary, expanded=True)
+
+def _step_qc_once(pass_id: int = 1) -> None:
+    """
+    Run qc_ai, persist, banner, and cache.
+
+    pass_id = 1  ➜  qc_prompt  / qc_output   (auto after draft-gen)
+    pass_id = 2  ➜  qc2_prompt / qc2_output  (manual “Run QC” button)
+    """
+    # 0) guard – make sure there is text
+    if not st.session_state.get("editable_draft_content"):
         st.warning("Generate a draft first.")
         return
 
-    draft_text = st.session_state.draft_output          # original draft
-    sidebar    = st.session_state.sidebar_info          # built in Generate step
+    email_txt = st.session_state.editable_draft_content.strip()
+    prompt    = _build_qc_prompt(email_txt)
 
-    # unified QC routine -------------------------------------------------
-    def run_full_qc(text: str) -> dict:
-        det = qc_det(text)
-        ai  = qc_ai(text) if det["__PASS__"] else {"__PASS__": False}
-        combo = {**det, **ai}
-        combo["__PASS__"] = det["__PASS__"] and ai["__PASS__"]
-        return combo
-    qc = run_full_qc(draft_text)
-    # -------------------------------------------------------------------
-
-    failed = [k for k, v in qc.items() if k not in ("__PASS__",) and v is False]
-
-    st.session_state.qc_prompt = "Full QC on current draft"
-    st.session_state.qc_output = "\n".join(
-        f"{'✅' if qc[r] else '❌'}  {r}" for r in qc if not r.startswith("__")
+    # 1) call the QC LLM
+    summary, _unused, model_reports = qc_ai.score(
+        email_txt,
+        domain=domain,
+        prompt_override=prompt,
+        return_models=True
     )
-    st.session_state.qc_passed = qc["__PASS__"]
 
-    show_io(st.session_state.qc_prompt, st.session_state.qc_output, "QC")
-
-    if qc["__PASS__"]:
-        st.success("🎉 Draft passed all QC checks!")
+    # 2) choose DB column names + UI label
+    if pass_id == 1:
+        col_prompt, col_output = "qc_prompt",  "qc_output"
+        ui_label = "🔍 QC summary"
     else:
-        st.error("🚨 Draft failed: " + ", ".join(failed))
-# ---------------------------------------------------------------
-def step_auto_fix():
-    """Runs auto-fix agent on last QC result."""
-    # build task + get untouched footer
-    autofix_task, frozen_footer = build_autofix_task(
-        draft_prompt       = st.session_state.draft_prompt,
-        original_draft       = st.session_state.draft_output,
-        quality_checklist  = st.session_state.qc_output,
-    )
+        col_prompt, col_output = "qc2_prompt", "qc2_output"
+        ui_label = "🔍 2nd QC summary"
 
-    autofix_crew = Crew(
-        agents=[qc_autofix_agent],
-        tasks=[autofix_task],
-        verbose=False,
-        process=Process.sequential,
-    )
-    autofix_body_raw = autofix_crew.kickoff()
-    raw_text = (
-        autofix_body_raw.output if hasattr(autofix_body_raw, "output")
-        else str(autofix_body_raw)
-    )
+    # 3) optional: store in multillm_qcresults only for first pass
+    if pass_id == 1:
+        try:
+            save_multillm_qc(
+                draft_txt     = st.session_state.get("rewrite_output", ""),
+                qc_prompt     = prompt,
+                model_reports = model_reports
+            )
+        except Exception as e:
+            logger.exception("multillm_qcresults insert failed")
 
-    clean_text = final_output_sanitizer(raw_text)
-    fixed_text = clean_text + frozen_footer
+    # 4) UI – collapsible block
+    with st.expander(ui_label, expanded=False):
+        if summary["__PASS__"]:
+            _ = st.success("✅ Passed all checks")
+        else:
+            _ = st.error("❌ Failed checks")
 
-    st.session_state.fix_prompt = autofix_task.description
-    st.session_state.fix_output = fixed_text
-    st.session_state.editable_draft_content = fixed_text
+        _ = st.json(summary, expanded=True)
 
+    # 5) toast + bullet list
+    if summary["__PASS__"]:
+        st.success("🎉 Draft PASSED all QC checks!")
+    else:
+        comments = summary.get("comments", {})
+        if not comments:  # fallback if model forgot to add comments
+            comments = {k: "failed (no details)"
+                        for k, ok in summary.items()
+                        if k != "__PASS__" and not ok}
+        bullet_lines = [f"**{rule}** — {comments.get(rule, 'failed')}"
+                        for rule, ok in summary.items()
+                        if rule != "__PASS__" and not ok]
+        st.error("❌ QC failed:\n\n" + "\n".join(bullet_lines))
+
+    # 6) cache in session_state
+    st.session_state[col_prompt] = prompt
+    st.session_state[col_output] = json.dumps(summary, indent=2)
+
+    # 7) guarantee we know the draft_pk before DB writes
+    if st.session_state.get("draft_pk") is None:
+        try:
+            st.session_state.draft_pk = get_draft_run_pk(st.session_state.run_id)
+        except Exception:
+            st.error("Draft not saved – click **Generate Draft** first.")
+            logger.exception("Cannot resolve draft_pk")
+            return  # abort save
+
+    # 8) write to draft_runs
     save_run(
         st.session_state.run_id,
-        fix_prompt=st.session_state.fix_prompt,
-        fix_output=st.session_state.fix_output,
+        **{col_prompt: prompt,
+           col_output: json.dumps(summary, indent=2)}
     )
 
-    st.success("✅ Autofix complete. Review below.")
+    # 9) telemetry + banner (only real models that ran)
+    prompt_tok = n_tokens(prompt)
+    comp_tok   = n_tokens(json.dumps(summary))
 
-    if 'fix_output' in st.session_state:
-        st.session_state.history.append(
-            ("Original", st.session_state.draft_output,
-             "Corrected", st.session_state.fix_output)
-        )
-    st.session_state.fix_done = True
-    show_io(st.session_state.fix_prompt, st.session_state.fix_output, "Auto-Fix")
-# ---------------------------------------------------------------
-def step_qc_after_fix():
-    """Runs QC again on fixed draft; writes pass/fail report."""
-    fixed_text = st.session_state.fix_output # Access the fixed text from session state
+    for mdl, rep in model_reports.items():
+        ptok = rep.get("prompt_tokens", prompt_tok)
+        ctok = rep.get("completion_tokens", comp_tok)
+        log_agent_run(st.session_state.run_id, "qc_ai", mdl, ptok, ctok)
+        push_banner("QC", mdl, rep.get("temperature", "?"), ptok, ctok)
 
-    # ────────────────────────────────────────────────────────────────────
-    # 📌  QUALITY CHECK 2  – deterministic + AI  (after Auto-Fix)
-    # ────────────────────────────────────────────────────────────────────
-    def run_full_qc(text: str) -> dict:
-        det = qc_det(text)
-        ai  = qc_ai(text) if det["__PASS__"] else {"__PASS__": False}  # skip LLM if rigid fail
-        combined = {**det, **ai}                                       # merge dicts
-        combined["__PASS__"] = det["__PASS__"] and ai["__PASS__"]
-        return combined
+# --------------------------------------------------------------
+# Scenario-ranking step  (runs after QC-1)
+# --------------------------------------------------------------
+def step_scenario_rank() -> None:
+    """
+    Reads the current editable draft & 10 subjects from session_state,
+    calls Groq Llama-4 Maverick, saves scenario + top-3 subject lines.
+    """
+    if not st.session_state.get("editable_draft_content"):
+        st.warning("Draft text missing – generate first.")
+        return
+    if not st.session_state.get("subject_lines"):
+        st.warning("Subject list missing.")
+        return
 
-    qc2 = run_full_qc(fixed_text)   # ← run on the final Auto-Fixed draft
+    draft_txt   = st.session_state.editable_draft_content.strip()
+    subjects_10 = st.session_state.subject_lines
 
-    # Format for UI
-    failed_rules = [k for k, v in qc2.items() if k not in ("__PASS__",) and v is False]
+    with st.spinner("Detecting scenario & ranking subjects…"):
+        data = groq_scenario_agent(draft_txt, subjects_10)
 
-    # ── save to session state so we can show later
-    st.session_state.qc2_report = qc2
-    st.session_state.qc2_failed = failed_rules
-    st.session_state.qc2_passed = qc2["__PASS__"]
+    scenario     = data.get("scenario", "").strip()
+    top_subjects = data.get("top_subjects", [])[:3]
 
-    # ── Log + immediate feedback ───────────────────────────────────────
-    if qc2["__PASS__"]:
-        st.success("🎉 Draft PASSED all deterministic + AI checks!")
-    else:
-        pass
-    st.session_state.re_qc_done = True
-    show_io(str(st.session_state.qc2_report), str(st.session_state.qc2_failed), "QC-After-Fix")
-# ────────────────────────────────────────────────────────────────
+    # cache for UI
+    st.session_state.scenario     = scenario
+    st.session_state.top_subjects = top_subjects
 
-def show_io(prompt_text: str, output_text: str, label: str):
-    with st.expander(f"🗂 {label} – prompt / output", expanded=False):
-        col_p, col_o = st.columns(2)
-        with col_p:
-            st.selectbox("Prompt", [prompt_text], index=0, label_visibility="collapsed")
-        with col_o:
-            st.selectbox("Output", [output_text], index=0, label_visibility="collapsed")
+    # persist
+    save_run(
+        st.session_state.run_id,
+        scenario  = scenario or None,
+        top_subj1 = top_subjects[0] if len(top_subjects) > 0 else None,
+        top_subj2 = top_subjects[1] if len(top_subjects) > 1 else None,
+        top_subj3 = top_subjects[2] if len(top_subjects) > 2 else None,
+    )
 
-# --- Streamlit UI ---
-st.set_page_config(page_title="CFP Email Draft Generator", layout="wide")
+    # light banner
+    push_banner("Scenario Agent", "llama-4-maverick→Groq", 0.2, 0, 0)
+
+# ######################################################################################################
+# ----------------------------------------- Streamlit UI -----------------------------------------------
+# ######################################################################################################
+
+
+
+# ------------------------------------------------------------------
+# 🔝  LIVE BANNER STRIP
+# ------------------------------------------------------------------
+
+if "banner_rows" not in st.session_state:
+    st.session_state.banner_rows = []           # list of dicts
+
+# Create a placeholder at the very top so it doesn’t scroll away
+_banner_box = st.empty()
+
+def _render_banners() -> None:
+    """Draw/update the banner strip."""
+    rows = st.session_state.banner_rows
+    if not rows:
+        _banner_box.empty()
+        return
+    with _banner_box.container():
+        st.markdown("### 🧠 Run summary")
+        for r in rows:
+            st.caption(
+                f"🧠 **{r['agent']}**  |  "
+                f"Model **{r['model']}**  |  "
+                f"T={r['temp']}  |  "
+                f"Prompt = {r['ptok']:,} |   "
+                f"Comp =  {r['ctok']:,} |  "
+                f"Total = {r['ptok']+r['ctok']:,} tokens  "
+            )
+
+def push_banner(agent: str, model: str, temp: float,
+                ptok: int, ctok: int) -> None:
+    """Append one row then re-render."""
+    st.session_state.banner_rows.append(
+        dict(agent=agent, model=model, temp=temp,
+             ptok=ptok, ctok=ctok)
+    )
+    _render_banners()
+
+# ------------------------------------------------------------------
 
 st.markdown("""
-<link href="https://fonts.googleapis.com/css2?family=Baskerville&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
 <style>
-/* Global Baskerville font */
-* {
-    font-family: 'Baskerville', serif !important;
-}
-/* Textarea styling */
+* { font-family: 'Inter', sans-serif !important; }
 [data-testid="stTextArea"] textarea {
-    color: #FFFFFF !important;
-    border: 1px solid #4A4A4A !important;
-    background-color: transparent !important; /* Make background transparent */
+    color: #eaeaea;  background: transparent; border: 1px solid #444;
 }
-/* Spam word highlighting */
-.highlight-spam {
-    color: #FF0000 !important;
-    background-color: #330000;
-    font-weight: bold;
-}
+.highlight-spam { color:#ff5c5c; background:#2d0000; font-weight:600; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📧 CFP Email Draft Generator")
+st.title("📧 Email Draft Generator")
 st.markdown("Generate professional Call-for-Papers (CFP) email drafts for academic journals.")
 
 # Initialize session state variables
@@ -740,6 +1287,14 @@ if 'rendered_html_output' not in st.session_state:
     st.session_state.rendered_html_output = ""
 if 'history' not in st.session_state: # Added for history
     st.session_state.history = []
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None   # or pull from your auth system
+if "timer_running" not in st.session_state:
+    st.session_state.timer_running = False
+if "timer_start_ts" not in st.session_state:   # epoch seconds when running
+    st.session_state.timer_start_ts = 0.0
+if "timer_elapsed_ms" not in st.session_state: # accumulated millis
+    st.session_state.timer_elapsed_ms = 0
 
 # Fetch data from database
 journals_data = fetch_journals()
@@ -750,58 +1305,134 @@ domains_data = fetch_domains()
 journals_dict = {journal['journal_title']: dict(journal) for journal in journals_data}
 domains_dict = {domain['domain_name']: dict(domain) for domain in domains_data}
 
+# --- PREP --------------------------------------------------------
+if "run_id" not in st.session_state:
+    st.session_state.run_id = str(uuid.uuid4())
+    # stamp the run’s creation date exactly once
+    st.session_state.creation_date = date.today()
+    st.session_state.banner_rows = []
+    _render_banners()
+
+base_day = st.session_state.creation_date
+submission_deadline_default = base_day + timedelta(days=random.randint(45, 60))
+waiver_deadline_default     = base_day + timedelta(days=random.randint(25, 35))
+
+short_names = [j["short_title"] for j in journals_data]
+default_short = short_names[0]         # or pull from st.session_state
+
 # Sidebar for inputs
 with st.sidebar:
-    st.header("Select Journal and Domain")
+    import datetime as _dt
 
-    # Journal Selection
-    journal_titles = [j['journal_title'] for j in journals_data]
-    selected_journal_title = st.selectbox("Choose a Journal", journal_titles)
-    selected_journal = journals_dict.get(selected_journal_title)
+    def _fmt(ms: int) -> str:
+        return str(_dt.timedelta(milliseconds=ms))
 
-    # Domain Selection
+    elapsed_ms = st.session_state.timer_elapsed_ms
+    if st.session_state.timer_running:
+        elapsed_ms += int((time.time() - st.session_state.timer_start_ts) * 1000)
+
+    label = "⏱️ Active Time"
+    if st.session_state.timer_running:      # while a long task is underway
+        label += " (running…)"
+
+    st.sidebar.markdown(f"### {label}: `{_fmt(elapsed_ms)}`")
+    # New Campaign subsection
+    st.header("Campaign Details")
+    campaign_name      = st.text_input("Campaign Name (internal)", "")
+
+    st.header("Journal Details")
+
+    selected_short = st.selectbox(
+        "Short Name",
+        short_names,
+        index=short_names.index(default_short)
+    )
+    selected_journal = next(
+        dict(j) for j in journals_data if j["short_title"] == selected_short
+    )
+    
+    # read-only facts
+    readonly("Full Title",  selected_journal["journal_title"])
+    readonly("ISSN",        selected_journal["issn"])
+    readonly("Sender Name", selected_journal["sender_full_name"])
+
+    st.session_state.journal_shortname = selected_journal["short_title"]   # or ["abbr"] if you store it there
+    # ──────────────────────────────────────────────────────────────
+    # ✏️ Scenario Picker – based on newsletter_analysis table
+    # ──────────────────────────────────────────────────────────────
+    st.header("Scenario Focus")
+
+    scenario_list = get_unique_scenarios_for_journal(selected_short)
+
+    # Allow typing a new one too
+    if scenario_list:
+        scenario_options = scenario_list + ["✍️ Enter a new scenario..."]
+    else:
+        scenario_options = ["✍️ Enter a new scenario..."]
+
+    selected_scenario = st.selectbox("Pick or type a scenario", scenario_options)
+
+    if selected_scenario == "✍️ Enter a new scenario...":
+        manual_scenario = st.text_input("Enter new scenario manually")
+    else:
+        manual_scenario = selected_scenario
+
+    # Store for use later
+    st.session_state.manual_scenario = manual_scenario
+
+    # Radio button for Draft Type
+    st.header("Draft Type")
+    
+    draft_type = st.radio("Choose the draft type", ("CFP", "Open", "Unopen"), horizontal=True)
+
+    st.header("Domain Details")
+    # Domain Selection - Reintroduced as per user feedback
     domain_names = [d['domain_name'] for d in domains_data]
     selected_domain_name = st.selectbox("Choose a Domain", domain_names)
     selected_domain = domains_dict.get(selected_domain_name)
+    st.session_state.domain_code  = selected_domain["domain_name"]
+    st.session_state.domain_term  = (
+        selected_domain["domain_name"]
+        .split("://", 1)[-1]        # strip http(s)://
+        .rstrip("/")                # strip trailing slash
+        .lower()
+    )
 
-    st.header("Manual Overrides / Additional Details")
-    # Populate fields with selected journal/domain data, allow override
-    journal_name = st.text_input("Journal Name", selected_journal['journal_title'] if selected_journal else "")
-    journal_short_name = st.text_input("Journal Short Name", selected_journal['short_title'] if selected_journal else "")
-    
-    pattern = f"%{journal_short_name.strip()}%"   # wildcard for SQL LIKE
+    readonly("Domain",      selected_domain_name)
+    readonly("Sender Email",selected_domain["sender_email"])
+    st.session_state.domain_code = selected_domain["domain_name"]
 
-    issn = st.text_input("ISSN Number", selected_journal['issn'] if selected_journal else "")
-    domain = st.text_input("Domain (e.g., Artificial Intelligence and Machine Learning)", selected_domain['domain_name'] if selected_domain else "")
-    
-    st.header("Submission Details")
-    special_issue = st.checkbox("Is this for a Special Issue?")
-    
-    # Waiver details
-    waiver_stance = selected_journal['waiver_stance'] if selected_journal else "❌ Minimal"
-    waiver_available = st.checkbox(f"Fee Waiver Available? (Journal Stance: {waiver_stance})", value="✅ Aggressive" in waiver_stance or "⚠️ Targeted" in waiver_stance)
-    fee_waiver_details = ""
-    # ─── fetch journal-level facts ───────────────────────────────────
-    recent_records = get_recent_campaign_raw(pattern, limit=10)
 
-    def first_recent_waiver(rows):
-        for r in rows:                         # newest → oldest
-            wp = r.get("waiver_percentage")
-            if wp is not None:
-                return wp
-        return None
+    st.header("Waiver Details")
 
-    last_waiver = get_last_waiver_percentage(pattern)
-    latest_row = get_latest_campaign(pattern) # NEW
+    waiver_deadline    = st.date_input("Waiver Deadline", value=waiver_deadline_default)
+    final_deadline     = st.date_input("Final Submission Deadline", value=submission_deadline_default)
+
+
+
+    # ------------------------------------------------------------------
+    # 🏷️  WAIVER DETAILS  – drop this right inside the sidebar
+    # ------------------------------------------------------------------
+    st.header("Waiver Details")
+
+    # Pattern for SQL LIKE queries (e.g., "%IJN%")
+    pattern = f"%{selected_short}%"
+
+    waiver_stance = selected_journal.get("waiver_stance", "❌ Minimal")
+    waiver_available = st.checkbox(
+        f"Fee Waiver Available? (Journal stance: {waiver_stance})",
+        value=("✅ Aggressive" in waiver_stance or "⚠️ Targeted" in waiver_stance),
+    )
+
+    # ── journal-level history ----------------------------------------
+    recent_records = get_recent_campaign_raw(pattern, domain=selected_domain_name, limit=10)
+    last_waiver    = get_last_waiver_percentage(pattern)
     waiver_display = "—" if last_waiver is None else f"{last_waiver}"
-    waiver_level = selected_journal["waiver_stance"] if selected_journal else "❌ Minimal"
+    recommended_pct, waiver_msg = recommend_waiver(waiver_stance, last_waiver)
 
-    recommended_pct, waiver_msg = recommend_waiver(waiver_level, last_waiver)
-
-    # UI – show stance + last + recommendation in a helpful note
     st.caption(
-        f"📑 Last campaign waiver: {waiver_display} % · "
-        f"Journal stance: {waiver_level} → suggested **{recommended_pct}%**"
+        f"📑 Last campaign waiver: {waiver_display}% · "
+        f"Journal stance: {waiver_stance} → suggested **{recommended_pct}%**"
     )
 
     waiver_percentage = st.number_input(
@@ -810,18 +1441,25 @@ with st.sidebar:
         value=recommended_pct if waiver_available else 0,
         step=1,
     )
-    if waiver_available:
-        fee_waiver_details = st.text_input("Fee Waiver Details (e.g., for submissions before July 15, 2025)", "Yes, for submissions before July 15, 2025")
 
-    # ─── sanity check before we build the prompt ─────────────────────
+    fee_waiver_details = ""
+    if waiver_available:
+        fee_waiver_details = st.text_input(
+            "Fee Waiver Details",
+            "Yes, for submissions before " + waiver_deadline.strftime("%B %d, %Y")
+        )
+
+    # ── sanity guard --------------------------------------------------
     def waiver_needs_attention() -> str | None:
-        if not waiver_available and waiver_level != "❌ Minimal":
+        if not waiver_available and waiver_stance != "❌ Minimal":
             return "The journal allows selective waivers, but you chose none."
-        if waiver_available and waiver_level == "❌ Minimal":
+        if waiver_available and waiver_stance == "❌ Minimal":
             return "This journal rarely grants waivers – please confirm."
         if waiver_available and abs(waiver_percentage - recommended_pct) > 10:
-            return f"Entered {waiver_percentage}% differs a lot from the "\
-                   f"recommended {recommended_pct}%."
+            return (
+                f"Entered {waiver_percentage}% differs a lot from the "
+                f"recommended {recommended_pct}%."
+            )
         return None
 
     warn_msg = waiver_needs_attention()
@@ -837,37 +1475,45 @@ with st.sidebar:
                 warn_msg = None   # user overrides
 
     if warn_msg and not st.session_state.waiver_override:
-        st.stop()   # prevent running the pipeline with questionable waiver
-    
-    st.header("Sender Information")
-    sender_name = st.text_input("Sender Name", selected_journal['sender_full_name'] if selected_journal else "")
-    sender_email = st.text_input("Sender Email", selected_domain['sender_email'] if selected_domain else "")
+        st.stop()   # halt build when waiver mismatch is unresolved
+    # ------------------------------------------------------------------
 
-    st.header("Additional Information")
-    impact_factor = st.text_input("Impact Factor", str(selected_journal['impact_factor']) if selected_journal and selected_journal['impact_factor'] is not None else "")
-    submission_deadline = st.text_input("Submission Deadline", "August 31, 2025") # This is a generic placeholder, could be added to DB
-    
-    # Checkboxes for additional journal details
-    include_acceptance_rate = st.checkbox("Include Acceptance Rate?")
-    include_volume_issue = st.checkbox("Include Volume and Issue?")
+    # Submission Stats
+    st.header("Submission Stats")
+    def _to_float(value, default=0.0):
+        try:
+            return float(str(value).replace('%', '').strip() or default)
+        except ValueError:
+            return default
+
+    acceptance_rate = st.number_input(
+        "Acceptance Rate (%)", 0.0, 100.0,
+        value=_to_float(selected_journal.get("acceptance_rate", 0.0))
+        )
+    vol_issue       = st.text_input("Volume & Issue", f"{selected_journal.get('volume', '')}/{selected_journal.get('issue', '')}" if selected_journal.get('volume') else "")
 
     # ─── Debug toggle ────────────────────────────────────────────────
-    debug_mode        = st.checkbox("🔍 Show debug info", value=False)
-    show_full_prompt  = st.checkbox("📄 Show full prompt before send", value=False)
+    #debug_mode        = st.checkbox("🔍 Show debug info", value=False)
+    #show_full_prompt  = st.checkbox("📄 Show full prompt before send", value=False)
 
     # ─── Sidebar debug (no metrics_block here) ───────────────
-    if debug_mode:
-        with st.expander("📊 Debug: recent rows"):
-            if recent_records:
-                st.markdown(f"```text\n{recent_table}\n```")
-            else:
-                st.write("No recent rows.")
-            st.write("First non-null waiver →", last_waiver)
-            st.write("Recommended % →", recommended_pct)
+    # Note: recent_records, recent_table, last_waiver, recommended_pct are now defined outside this block
+    # and should be accessible.
+    #if debug_mode:
+        #with st.expander("📊 Debug: recent rows"):
+            # Assuming recent_records and recent_table are still available from a broader scope
+            # or need to be re-fetched if their scope was limited.
+            # For now, keeping as is, assuming they are accessible.
+            #if 'recent_records' in locals() and recent_records: # Check if defined and not empty
+                #st.markdown(f"```text\n{recent_table}\n```")
+            #else:
+                #st.write("No recent rows.")
+            #st.write("First non-null waiver →", last_waiver)
+            #st.write("Recommended % →", recommended_pct)
 
         # Always log to console even if UI box is closed
-        logger.info("[SIDEBAR] rows=%s waiver=%s rec_pct=%s",
-                    len(recent_records), last_waiver, recommended_pct)
+        #logger.info("[SIDEBAR] rows=%s waiver=%s rec_pct=%s",
+                    #len(recent_records) if 'recent_records' in locals() else 0, last_waiver, recommended_pct)
 
     # Dynamic URL construction
     base_journal_url = selected_domain['domain_url'] if selected_domain else "https://example.com"
@@ -889,7 +1535,11 @@ with st.sidebar:
     
     # First URL: can be any from other_url_suffixes or one from issue_archive_suffixes
     possible_first_urls = other_url_suffixes + issue_archive_suffixes
-    
+
+    # These were removed from the sidebar in previous steps.
+    special_issue = st.checkbox("Is this for a Special Issue?", key="special_issue_global_compat")
+    include_acceptance_rate = st.checkbox("Include Acceptance Rate?", key="include_acceptance_rate_global_compat")
+    include_volume_issue = st.checkbox("Include Volume and Issue?", key="include_volume_issue_global_compat")
     # Use random.sample to pick 2 unique URLs from the combined list
     # Ensure there are at least 2 unique URLs available
     if len(possible_first_urls) >= 2:
@@ -900,55 +1550,144 @@ with st.sidebar:
         while all(url in issue_archive_suffixes for url in selected_other_urls):
             selected_other_urls = random.sample(possible_first_urls, 2)
     elif len(possible_first_urls) == 1:
-        selected_other_urls = [possible_first_urls[0], ""] # Only one URL available
+        selected_other_urls = [possible_first_urls[0], ""]
     else:
-        selected_other_urls = ["", ""] # No URLs available
-
+        selected_other_urls = ["", ""]
 
     other_url_1 = st.text_input("Other URL 1", f"{full_journal_url}{selected_other_urls[0]}")
     other_url_2 = st.text_input("Other URL 2", f"{full_journal_url}{selected_other_urls[1]}")
 
-    # Radio button for Draft Type
-    draft_type = st.radio("Draft Type", ("CFP", "Open"))
+    
 
-if 'run_id' not in st.session_state:
-    st.session_state.run_id = str(uuid.uuid4())
+# ── Legacy var aliases for downstream functions ───────────────────
+journal_short_name  = selected_short                               # was global before
+journal_name        = selected_journal["journal_title"]
+issn                = selected_journal["issn"]
+domain              = selected_domain_name
+impact_factor       = selected_journal.get("impact_factor", "")
+sender_name         = selected_journal["sender_full_name"]
+sender_email        = selected_domain["sender_email"]
+submission_deadline = final_deadline.strftime("%B %d, %Y")   # NEW
+special_issue       = st.session_state.get("special_issue", False) # NEW
 
-if 'draft_prompt' in st.session_state:
-    with st.expander("🪄 Draft-writer prompt / output", expanded=False):
-        st.code(st.session_state.draft_prompt, language="markdown")
-        st.code(st.session_state.draft_output, language="markdown")
+# Re-declare variables that were previously in the sidebar and are needed globally
+include_acceptance_rate = st.session_state.get("include_acceptance_rate", False) # NEW
+include_volume_issue = st.session_state.get("include_volume_issue", False) # NEW
+
+# Re-derive URLs as they were part of the sidebar logic
+base_journal_url = selected_domain['domain_url'] if selected_domain else "https://example.com"
+journal_path_suffix = selected_journal['journal_path'] if selected_journal else ""
+full_journal_url = f"{base_journal_url}{journal_path_suffix}"
+
+other_url_suffixes = [
+    "/about", "/editorial-board", "/aim-and-scope", "/instructions-for-author",
+    "/article-processing-charges", "/membership"
+]
+issue_archive_suffixes = ["/current-issue", "/previous-issue", "/archives"]
+possible_first_urls = other_url_suffixes + issue_archive_suffixes
+selected_other_urls = []
+if len(possible_first_urls) >= 2:
+    selected_other_urls = random.sample(possible_first_urls, 2)
+    while all(url in issue_archive_suffixes for url in selected_other_urls):
+        selected_other_urls = random.sample(possible_first_urls, 2)
+elif len(possible_first_urls) == 1:
+    selected_other_urls = [possible_first_urls[0], ""]
+else:
+    selected_other_urls = ["", ""]
+
+submit_paper_url = f"{full_journal_url}/submit-paper"
+other_url_1 = f"{full_journal_url}{selected_other_urls[0]}"
+other_url_2 = f"{full_journal_url}{selected_other_urls[1]}"
+
+# waiver_available, waiver_percentage, fee_waiver_details are handled in the Waiver Details block
+# ---------------------------------------------------------------
+
+# ──────────────────────────────  TOOLBAR  ──────────────────────────
+btn_cols = st.columns(3)
+
+with btn_cols[0]:
+    gen_qc_clicked = st.button(
+        "▶ Generate Draft + QC",
+        key="btn_generate_qc",
+        type="primary",
+        disabled=not campaign_name.strip()
+    )
+
+with btn_cols[1]:
+    qc_clicked = st.button(
+        "🕵️ Run QC",
+        key="btn_qc",
+        disabled=not st.session_state.get('editable_draft_content')
+    )
+
+with btn_cols[2]:
+    html_clicked = st.button(
+        "💾 Save & ➡️ HTML",
+        key="btn_html",
+        disabled=not st.session_state.get('editable_draft_content')
+    )
+# -------------------------------------------------------------------
+
+_render_cached_qc()          # still shows qc_prompt / qc_output
+_render_cached_qc2()         # new helper (below)
 
 
-if 'qc_prompt' in st.session_state:
-    with st.expander("🔍 QC prompt / output", expanded=False):
-        st.code(st.session_state.qc_prompt, language="markdown")
-        st.code(st.session_state.qc_output, language="markdown")
+# ── Spam score banner ─────────────────────────────────────────
+m = st.session_state.get("spam_metrics")
+if m:
+    st.markdown(
+        f"""### 🛑 Spam Score&nbsp;&nbsp;**{m['score']}/5 (greater the score, lower the spam)**
+<sub>{m['pct']} % spam words  
+{m['spam_words']} / {m['words']} words  
+{', '.join(m['spam_list']) or '—'}</sub>
+""",
+        unsafe_allow_html=True
+    )
+    # Extract values from spam_metrics
+    spam_pct = round(m.get("pct", 0.0), 2)
+    spamwordcount_str = f"{m.get('spam_words', 0)} / {m.get('words', 0)} words"
+
+    # Save into draft_runs table
+    save_run(
+        st.session_state.run_id,
+        spam_percentage = spam_pct,
+        spamwordcount   = spamwordcount_str
+    )
+
+# ── Scenario banner ───────────────────────────────────────────
+if st.session_state.get("scenario"):
+    st.markdown(f"### 🧭 Scenario: **{st.session_state.scenario}**")
+
+if st.session_state.get("top_subjects"):
+    st.markdown("**Top-3 Suggested Subjects:**")
+    st.markdown("\n".join(f"{i+1}. {s}"
+                          for i, s in enumerate(st.session_state.top_subjects)))
 
 
-if 'fix_prompt' in st.session_state:
-    with st.expander("🛠 Auto-Fix prompt / output", expanded=False):
-        st.code(st.session_state.fix_prompt, language="markdown")
-        st.code(st.session_state.fix_output, language="markdown")
-
-# Create two columns for side-by-side layout
 if st.session_state.subject_lines:
     st.subheader("🎯 Subject Lines")
     st.markdown("\n".join(f"- {s}" for s in st.session_state.subject_lines))
+
+# ------------------------------------------------------------------
+# Final Draft editor & highlight preview
+# ------------------------------------------------------------------
+def _sync_editor_state() -> None:
+    txt = st.session_state.final_draft
+    st.session_state.editable_draft_content = txt
+    st.session_state.email_body_txt        = txt   # legacy key kept alive
 
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Final Draft (Editable)")
-    edited_draft_text = st.text_area(
-        "Edit your draft here:", # Added the label argument
+    st.text_area(
+        "Edit your draft here:",          # label
         value=st.session_state.editable_draft_content,
         height=600,
         key="final_draft",
-        help="Edit directly - remaining spam words highlighted in red"
+        on_change=_sync_editor_state,     # ← NEW
+        help="Press Ctrl + Enter to apply edits."
     )
-    # Update session state with the content from the text area
-    st.session_state.editable_draft_content = edited_draft_text
 
 with col2:
     st.subheader("Spam Highlights Preview")
@@ -966,26 +1705,49 @@ with col2:
         unsafe_allow_html=True
     )
 
-# --- toolbar ----------------------------------------------------
-btn_cols = st.columns(4)
-with btn_cols[0]:
-    gen_clicked = st.button("▶  Generate Draft", key="btn_generate", type="primary")
-with btn_cols[1]:
-    qc_clicked  = st.button("🕵️  Run QC",         key="btn_qc",
-                            disabled=not st.session_state.get('generated_draft'))
-with btn_cols[2]:
-    fix_clicked = st.button("🔧  Auto-Fix",       key="btn_fix",
-                            disabled=not st.session_state.get('qc_output'))
-with btn_cols[3]:
-    re_qc_clicked = st.button("✅  QC After Fix", key="btn_re_qc",
-                              disabled=not st.session_state.get('fix_output'))
+# --- call the steps *after* we know which button was pressed --------
+# ---------------------------------------------------------------
+if gen_qc_clicked:
+    # brand-new run UUID each time
+    st.session_state.run_id = str(uuid.uuid4())
+    st.session_state.pop("draft_id", None)
 
-# --- call the steps *after* we know which button was pressed ----
-if gen_clicked:   step_generate_and_spam()
-if qc_clicked:    step_qc_only()
-if fix_clicked:   step_auto_fix()
-if re_qc_clicked: step_qc_after_fix()
+    # stopwatch ⏱️
+    st.session_state.timer_running    = False
+    st.session_state.timer_elapsed_ms = 0
+    _start_timer()
+
+    # ① generate first draft (incl. spam clean)
+    step_generate_and_spam()
+
+    # ② immediate QC on that fresh draft
+    _step_qc_once(pass_id=1)
+
+    # ③ scenario + top-3 subjects
+    step_scenario_rank()
+
+    _pause_timer()
+    st.rerun()          # refresh UI with QC result & enable “Run QC” button
+# ---------------------------------------------------------------
+
+if qc_clicked:          # manual re-check after edits
+    _start_timer()
+    _step_qc_once(pass_id=2)
+    _pause_timer()
+# ---------------------------------------------------------------
+
+if html_clicked:
+    _start_timer()
+    step_save_and_html()
+    _pause_timer()
+
+    # final write to draft_runs
+    save_run(
+        st.session_state.run_id,
+        active_ms = st.session_state.timer_elapsed_ms
+    )
             
+# ---------------------------------------------------------------
 
 
 # Leftover Spam Words
@@ -1004,31 +1766,31 @@ elif word_count > 600:
     warn = "⚠️ Too long!"
 st.caption(f"📝 Core content: {word_count} words {warn}")
 
-if "qc2_report" in st.session_state:
-    with st.expander("🔍 Full QC results", expanded=False):
-        df_qc = (pd.DataFrame(
-                    [{"Rule": k, "Pass": "✅" if v else "❌"}
-                     for k, v in st.session_state.qc2_report.items()
-                     if not k.startswith("__")]
-                 ) .sort_values("Rule"))
-        st.table(df_qc)
+# if "qc2_report" in st.session_state:
+#     with st.expander("🔍 Full QC results", expanded=False):
+#         df_qc = (pd.DataFrame(
+#                     [{"Rule": k, "Pass": "✅" if v else "❌"}
+#                      for k, v in st.session_state.qc2_report.items()
+#                      if not k.startswith("__")]
+#                  ) .sort_values("Rule"))
+#         st.table(df_qc)
 
-if st.session_state.get("re_qc_done"):
-    passed = st.session_state.qc2_passed
-    st.markdown("---")
-    st.header("🏁 Final QC Result")
-    if passed:
-        st.success("🎉 **All QC checks passed after auto-fix!**")
-    else:
-        pass
+# if st.session_state.get("re_qc_done"):
+#     passed = st.session_state.qc2_passed
+#     st.markdown("---")
+#     st.header("🏁 Final QC Result")
+#     if passed:
+#         st.success("🎉 **All QC checks passed after auto-fix!**")
+#     else:
+#         pass
 
-if "qc_report" in st.session_state and st.session_state.qc_report:
-    with st.expander("📝 QC report", expanded=False):
-        if st.session_state.qc_report["passed"]:
-            st.markdown("**All checks passed ✅**")
-        else:
-            for item in st.session_state.qc_report["checklist"]:
-                st.write(item)
+# if "qc_report" in st.session_state and st.session_state.qc_report:
+#     with st.expander("📝 QC report", expanded=False):
+#         if st.session_state.qc_report["passed"]:
+#             st.markdown("**All checks passed ✅**")
+#         else:
+#             for item in st.session_state.qc_report["checklist"]:
+#                 st.write(item)
 
 # # Display remaining issues after autofix, if any
 # if "editable_draft_content" in st.session_state and "🛠 Remaining Issues" in st.session_state.editable_draft_content:
@@ -1058,6 +1820,3 @@ if st.session_state.generated_html_code:
             st.session_state.rendered_html_output,
             unsafe_allow_html=True
         )
-
-st.markdown("---")
-st.info("To run this application, save it as `streamlit_app.py` and execute `streamlit run streamlit_app.py` in your terminal.")

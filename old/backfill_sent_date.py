@@ -1,4 +1,4 @@
-from database_sync_pipeline import DatabaseSyncPipeline
+from crewai_agent.old.database_sync_pipeline import DatabaseSyncPipeline
 from datetime import datetime
 import pymysql, os
 from dotenv import load_dotenv

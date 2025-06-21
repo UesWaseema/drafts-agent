@@ -3,7 +3,7 @@ import pandas as pd
 import json
 import logging
 from datetime import datetime, timedelta
-from agent_ranking import AgentRanking
+from crewai_agent.old.agent_ranking import AgentRanking
 import schedule
 import time
 import os
