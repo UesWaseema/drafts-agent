@@ -78,10 +78,15 @@ TONE & VOICE (MUST)
 CONTENT RULES
 • MUST NOT start with clichés (“I hope this message finds you well.”).
 • MUST NOT contain formulaic praise (“Your research is important …”).
-• Opening sentence MUST highlight data-driven research and connect to the recipient’s field.
 • MUST state submission deadline(s) and cutoff date(s).
+• IF there are **two deadlines** when a fee waiver applies:
+  • First deadline = last date the **Fee Waiver** can be used.  
+  • Second deadline = final submission date (full APC applies after the first deadline).
 • If a fee waiver exists, include it once; otherwise stay silent.
 • Present journal benefits factually (e.g. Impact Factor 6.044, avg. decision ≈ 45 days).
+• If ISSN is provided, include it (format **ISSN: xxxx-xxxx**) adjacent to the first journal-name mention; do NOT repeat ISSN elsewhere.
+• Keep ISSN near the journal name, never in random locations.
+• MUST NOT write phrases such as “While the journal does not currently report an Impact Factor” or “ISSN details can be found on our website”.
 • Journal full name appears **once** in the intro and **once** in the signature — otherwise use the short name or “the journal”.
 • MUST provide all URLs in full plain text (no hyperlink tags).
 • MUST show sender name and sender e-mail visibly.
@@ -179,7 +184,10 @@ narration, narrating, Pushing, pushes, narrates, innovating, joining,
 collaborating, excite, shape, shapes, unlock, unlocked, unlocks, build, builds,
 milestone, milestones, excites, boundary, challenges, cornerstones, discovered,
 Empowers, intricate, landscapes, pave, pioneer, unravels, challenged,
-unraveling, discovering, Empowered, paves, challenging, unraveled
+unraveling, discovering, Empowered, paves, challenging, unraveled, final, here, 
+team, explores, welcome, field
+
+-------------------------------------------------------------------------------
 
 If any forbidden word or phrase is in the draft, you MUST replace or remove it
 before emitting the final output.

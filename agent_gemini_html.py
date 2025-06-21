@@ -41,6 +41,7 @@ HARD RULES
    • Do not alter the text—just wrap and preserve it.
 7. Output **pure HTML, nothing else** – no <html>, <head>, <body>, no “Sure,
    here is the HTML:” prose, no markdown fences.
+8. Side headings – wrap in <p> tags only, and never use ALL CAPS.
 """
 
 """
@@ -66,11 +67,35 @@ def which_app(domain_code: str) -> str:
 # ────────────────────────────────────────────────────────────────
 # 1.  Header / footer templates
 # ────────────────────────────────────────────────────────────────
-INT_HEADER = """<!DOCTYPE html ... (snip – same as before) ... Dear Dr. %%First Name%%,</p>"""
+INT_HEADER = """<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" />
+<title>Research</title></head>
+<body><table border="0" align="center" style="width: 600px; margin-left: auto; margin-right: auto;"><tbody><tr><td>
+<p>Dear Dr. %%First Name%%,</p>
+"""
 INT_FOOTER = """</td></tr></tbody></table></body></html>"""
 
-MW_HEADER_TMPL = """<!DOCTYPE html ... title>{journal_shortname}</title> ... Dear Dr. [NAME],</span></p>"""
-MW_FOOTER = """<p><span ...>If you prefer not to receive further updates, you can <a href="[DIRECT_UNSUBSCRIBE_URL]">Unsubscribe</a>.</span></p></td></tr></tbody></table></body></html>"""
+MW_HEADER_TMPL = """<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" />
+<title>{journal_shortname}</title>
+<link id="dark-mode-custom-link" rel="stylesheet" type="text/css" />
+<link id="dark-mode-general-link" rel="stylesheet" type="text/css" />
+<style id="dark-mode-custom-style" lang="en" type="text/css"></style>
+<style id="dark-mode-native-style" lang="en" type="text/css"></style>
+<style id="dark-mode-native-sheet" lang="en" type="text/css"></style>
+</head>
+<body data-gr-ext-disabled="forever" data-gr-ext-installed="" data-new-gr-c-s-check-loaded="14.1240.0" data-new-gr-c-s-loaded="14.1240.0">
+<table align="left" border="0" style="width: 620px; margin-left: auto; margin-right: auto;"><tbody><tr>
+<td style="font-family:Lucida Sans Unicode,Lucida Grande,sans-serif;">
+<p>Dear Dr. [NAME],</p>
+"""
+
+MW_FOOTER = """<p>If you prefer not to receive further updates, you can <a href="[DIRECT_UNSUBSCRIBE_URL]">Unsubscribe</a>.</p>
+</td></tr></tbody></table></body></html>"""
 
 def wrap_with_template(body_html: str, domain_code: str, journal_shortname: str) -> str:
     if which_app(domain_code) == "interspire":
