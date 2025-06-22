@@ -88,7 +88,14 @@ def calc_spam_metrics(email_txt: str) -> dict:
 
 # --- Configuration for LLM ---
 os.environ["LITELLM_DEBUG"] = "False" # Set to False for production, True for debugging
-OPENROUTER_API_KEY = "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" # Replace with your actual key
+# Load the OpenRouter key from the shell environment
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")  # make sure this is exported
+
+if not OPENROUTER_API_KEY:
+    raise RuntimeError(
+        "OPENROUTER_API_KEY environment variable is not set. "
+        "Export it before running the script."
+    )
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 
 class CustomLiteLLM(BaseLLM):
