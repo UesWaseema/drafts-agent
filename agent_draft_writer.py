@@ -230,5 +230,3 @@ def create_draft_task(
         agent=agent,
         expected_output="A CFP e-mail draft that satisfies every HOUSE RULE.",
     )
-
-

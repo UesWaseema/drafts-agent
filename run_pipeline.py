@@ -1,3 +1,5 @@
+import logging_bootstrap           # ← FIRST import, fixes logging
+import logging_bootstrap           # ← FIRST import, fixes logging
 import os
 import streamlit as st, math
 import random
@@ -21,6 +23,11 @@ st.set_page_config(page_title="Draft Generator", layout="wide")
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("qc_ai").setLevel(logging.DEBUG)
+
+# Enable verbose logging
+DEBUG = os.getenv("LOG_LEVEL", "INFO").upper() == "DEBUG"
+logger = logging.getLogger("cfp_debug")
+logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
 
 # ── Token length helper ────────────────────────────────────────────
 try:
@@ -182,17 +189,54 @@ from agent_scenario import (
 )
 
 # 👇 NEW
+from common import INTERSPIRE_DOMAINS, MAILWIZZ_DOMAINS
+
 from interspire_helpers import (
-    get_recent_campaign_raw,          # NEW
+    get_recent_campaign_raw as _isp_fetch,          # NEW
     rows_to_json,
     get_last_waiver_percentage,
     get_latest_campaign, # NEW
 )
+from mailwizz_helpers import get_mailwizz_recent_campaigns as _mw_fetch
+
 import datetime as _dt # Added for stopwatch
-import json # NEW
+import re, html, pandas as pd, json
 
 from crewai import LLM # NEW
 LLM.provider = 'openrouter' # NEW
+
+def _plain_preview(html_txt: str, max_chars: int = 350) -> str:
+    txt = re.sub("<[^>]+>", "", html_txt or "")
+    txt = html.unescape(txt).strip()
+    return (txt[:max_chars] + " …") if len(txt) > max_chars else txt
+
+def fetch_recent_campaigns(pattern: str,
+                           domain: str,
+                           limit: int = 10) -> list[dict]:
+    """
+    Return the N latest campaigns for *pattern* from the correct system,
+    plus an extra helper field:
+        "draft_type" = "CFP" | "Open" | "Unknown"
+        "preview"    = plain-text 350-char snippet of the HTML body
+    """
+    if domain in INTERSPIRE_DOMAINS:
+        rows = _isp_fetch(pattern, domain=domain, limit=limit)
+    elif domain in MAILWIZZ_DOMAINS:
+        rows = _mw_fetch(pattern, domain=domain, limit=limit)
+    else:
+        raise ValueError(f"Domain {domain} is in neither system list.")
+
+    for r in rows:
+        name = r.get("campaign_name", "") or ""
+        if name.startswith("CFP_"):
+            r["draft_type"] = "CFP"
+        elif name.startswith("OPEN_"):
+            r["draft_type"] = "Open"
+        else:
+            r["draft_type"] = "Unknown"
+        body_html = r.get("email_body") or r.get("email", "")   # 🆕 add fallback
+        r["preview"] = _plain_preview(body_html)
+    return rows
 
 # ────────────────────────────────────────────────────────────────────
 # 📌  QUALITY CHECK 2  – deterministic + AI  (after Auto-Fix)
@@ -218,6 +262,7 @@ def get_draft_run_pk(run_uuid: str) -> int:
 # ────────────────────────────────────────────────────────────────────
 def step_spam_clean(draft: str) -> str:
     found = get_leftover_spam_words(draft, SPAM_WORDS)
+    logger.debug("Spam detector → %s", found)           # show list even if empty
     if not found:
         return draft
 
@@ -247,6 +292,7 @@ Only return the updated draft text. Nindo commentary. No metadata.
 
     result = crew.kickoff()
     cleaned = final_output_sanitizer(str(result))
+    logger.debug("Spam-cleaned length=%d", len(cleaned))
 
     # ── NEW: compute spam metrics & persist score ────────────────
     metrics = calc_spam_metrics(cleaned)
@@ -281,6 +327,22 @@ Only return the updated draft text. Nindo commentary. No metadata.
 
     return cleaned
 
+# ────────────────────────────────────────────────────────────────────
+# 🔍 Helper – build a LIKE pattern that matches the ESP’s journal column
+#     • Interspire stores the SHORT title exactly.      (e.g. IJN)
+#     • MailWizz  stores the FULL title, but without a
+#       leading “Journal of …”.                        (e.g. International Nutrition)
+# --------------------------------------------------------------------
+def build_like_pattern(is_interspire: bool,
+                       short: str,
+                       full: str) -> str:
+    """
+    Return a SQL-LIKE pattern suitable for the current ESP.
+    """
+    if is_interspire:                     # Interspire path
+        return f"%{short}%"
+    clean_full = re.sub(r"^\s*journal\s+of\s+", "", full, flags=re.I).strip()
+    return f"%{clean_full}%"
 
 # ────────────────────────────────────────────────────────────────
 def step_generate_and_spam():
@@ -343,63 +405,63 @@ def step_generate_and_spam():
         
         instructions_content += f"\n\nUse the following template as a base for the email draft:\n\n{template_content}"
 
-        # ─── 1. fetch the last 10 campaigns ──────────────────────────────
-        pattern = f"%{journal_short_name}%"          # e.g. "%IJN%"
-        records  = get_recent_campaign_raw(pattern, domain=selected_domain_name, limit=10)
+        # Update pattern-building call
+        is_isp  = selected_domain_name in INTERSPIRE_DOMAINS
+        pattern = build_like_pattern(
+            is_interspire = is_isp,
+            short         = journal_short_name,
+            full          = journal_name
+        )
+    
+
+        records = fetch_recent_campaigns(
+            pattern = pattern,              # wild-card LIKE '%Big Data Research%'
+            domain  = selected_domain_name, # sidebar pick (CFP10, NCFP9, etc.)
+            limit   = 10
+        )
 
 
-        # ─── 3. waiver analysis message  (unchanged) ─────────────────────
-        # waiver_level = selected_journal["waiver_stance"] if selected_journal else "❌ Minimal" # Moved up
-        # last_waiver  = get_last_waiver_percentage(journal_name) # Moved up
-        # _, waiver_text = recommend_waiver(waiver_level, last_waiver) # Moved up
+     # ---------- NEW recent-campaign JSON block -----------------
+        keep_cols = ["campaign_name", "draft_type",
+                    "subject", "sent_date", "preview"]
 
-        # ========== BEGIN PATCH (replace the current DataFrame / JSON block) ==========
-        # Keep only the 3 columns we care about
-        keep_cols = ["subject", "email", "sent_date"]
-
-        trimmed_rows = [
-            {k: r.get(k) for k in keep_cols} for r in records
-        ]
-
-        df_recent = pd.DataFrame(trimmed_rows)
+        df_recent = pd.DataFrame([{k: r.get(k) for k in keep_cols} for r in records])
 
         if not df_recent.empty:
             recent_table = df_recent.to_markdown(index=False)
-            recent_json  = df_recent.to_json(
-                orient="records",
-                indent=2,
-                date_format="iso"
-            )
+            recent_json  = df_recent.to_json(orient="records",
+                                            indent=2,
+                                            date_format="iso")
+            latest_json  = json.dumps(df_recent.iloc[0].to_dict(),
+                                    indent=2, default=str)
         else:
             recent_table = "*No recent rows found for this journal.*"
             recent_json  = "[]"
+            latest_json  = "{}"
+# -----------------------------------------------------------
 
-        latest_json = json.dumps(trimmed_rows[0] if trimmed_rows else {},
-                                 indent=2, default=str)
-        # ========== END PATCH =========================================================
+        waiver_md = f"""
+        🧾 **Waiver Analysis**
 
-        metrics_block = f"""
-🧾 **Waiver Analysis**
+        Last waiver offered : {last_waiver or 'N/A'} %  
+        Journal stance      : {waiver_level}  
+        Suggested now       : {recommended_pct}% ({waiver_msg})
+        """
 
-Last waiver offered : {last_waiver or 'N/A'} %  
-Journal stance      : {waiver_level}  
-Suggested now       : {recommended_pct}% ({waiver_msg})
-
-if draft_type == "CFP":
-        return (
-            waiver_md +
-            "\n📈 **JSON export of the same 10 rows**  \n```json\n"
-            f"{recent_json}\n```\n\n"
-            "📌 **Most-recent row only**\n```json\n"
-            f"{latest_json}\n```"
-        )
-
-    # --- reminder / “Open” branch (single previous draft) -------------
-    return (
-        waiver_md +
-        "\n📌 **Previous CFP JSON (1 row)**\n```json\n"
-        f"{latest_json}\n```"
-    )"""
+        if draft_type == "CFP":
+            json_block = (
+                "\n📈 **JSON export of the same 10 rows**  \n```json\n"
+                f"{recent_json}\n```\n\n"
+                "📌 **Most-recent row only**\n```json\n"
+                f"{latest_json}\n```"
+            )
+        else:
+            # --- reminder / “Open” branch (single previous draft) -------------
+            json_block = (
+                "\n📌 **Previous CFP JSON (1 row)**\n```json\n"
+                f"{latest_json}\n```"
+            )
+        metrics_block = waiver_md + json_block
 
         # ─── Prompt-level debug (runs only after metrics_block exists) -----
         #if debug_mode:
@@ -540,6 +602,9 @@ if draft_type == "CFP":
                 process=Process.sequential
             )
             result = crew.kickoff()
+            logger.debug("Draft-writer returned type=%s chars=%d",
+                         type(result).__name__,
+                         len(str(result)))
 
             # ---------- token bookkeeping ----------
             usage = getattr(result, "usage", {})
@@ -1081,7 +1146,7 @@ def _step_qc_once(pass_id: int = 1) -> None:
     Run qc_ai, persist, banner, and cache.
 
     pass_id = 1  ➜  qc_prompt  / qc_output   (auto after draft-gen)
-    pass_id = 2  ➜  qc2_prompt / qc2_output  (manual “Run QC” button)
+    pass_id = 2  ➜  qc2_prompt / qc2_output  (manual "Run QC" button)
     """
     # 0) guard – make sure there is text
     if not st.session_state.get("editable_draft_content"):
@@ -1089,15 +1154,25 @@ def _step_qc_once(pass_id: int = 1) -> None:
         return
 
     email_txt = st.session_state.editable_draft_content.strip()
+    logger.debug("QC pass=%d — text_len=%d", pass_id, len(email_txt))
     prompt    = _build_qc_prompt(email_txt)
 
     # 1) call the QC LLM
-    summary, _unused, model_reports = qc_ai.score(
-        email_txt,
-        domain=domain,
-        prompt_override=prompt,
-        return_models=True
-    )
+    try:
+        logger.debug("Calling qc_ai.score()  return_models=True")
+        summary, prompt_used, model_reports = qc_ai.score(
+            email_txt,
+            domain=domain,
+            prompt_override=prompt,
+            return_models=True
+        )
+        logger.debug("qc_ai returned keys=%s", list(summary.keys()))
+        logger.debug("qc_ai model_reports for %d models: %s",
+                     len(model_reports), ', '.join(model_reports.keys()))
+    except Exception as err:
+        st.error(f"QC crashed: {err}")
+        logger.exception("QC step failed")
+        return
 
     # 2) choose DB column names + UI label
     if pass_id == 1:
@@ -1248,6 +1323,7 @@ def _render_banners() -> None:
 def push_banner(agent: str, model: str, temp: float,
                 ptok: int, ctok: int) -> None:
     """Append one row then re-render."""
+    logger.debug("Banner: %s | %s %s", agent, model, ptok+ctok)
     st.session_state.banner_rows.append(
         dict(agent=agent, model=model, temp=temp,
              ptok=ptok, ctok=ctok)
@@ -1425,7 +1501,6 @@ with st.sidebar:
     )
 
     # ── journal-level history ----------------------------------------
-    recent_records = get_recent_campaign_raw(pattern, domain=selected_domain_name, limit=10)
     last_waiver    = get_last_waiver_percentage(pattern)
     waiver_display = "—" if last_waiver is None else f"{last_waiver}"
     recommended_pct, waiver_msg = recommend_waiver(waiver_stance, last_waiver)
@@ -1612,6 +1687,8 @@ with btn_cols[0]:
         type="primary",
         disabled=not campaign_name.strip()
     )
+    if gen_qc_clicked:
+        logger.debug("▶ button clicked – new run_id=%s", st.session_state.run_id)
 
 with btn_cols[1]:
     qc_clicked = st.button(

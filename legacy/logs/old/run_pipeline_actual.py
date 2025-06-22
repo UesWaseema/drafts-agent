@@ -97,6 +97,7 @@ from interspire_helpers import (
     get_last_waiver_percentage,
     get_latest_campaign, # NEW
 )
+from mailwizz_helpers import get_recent_campaign_raw
 import datetime # Added for rows_to_json
 import json # NEW
 

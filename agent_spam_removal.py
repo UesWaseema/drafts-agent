@@ -1,6 +1,6 @@
 import re
 from crewai import Agent, Task
-from common import get_llm_for_stance # Import the LLM from common
+from common import gemini25_preview_llm # Import the LLM from common
 
 spam_removal_agent = Agent(
     role='Spam word replacement and draft refinement specialist',
@@ -8,7 +8,7 @@ spam_removal_agent = Agent(
     backstory="""You are an expert in text sanitization and lexical substitution. Your primary function is to enhance written drafts by eliminating spam words through precise synonym replacement while maintaining absolute fidelity to original formatting and identifiers.""",
     verbose=False,
     allow_delegation=False,
-    llm=get_llm_for_stance,
+    llm=gemini25_preview_llm,
     max_iter=2,  # Preserved from original
     generation_config={  # New critical addition
         "stop_sequences": ["\nThought:", "\nPlan:", "\nReasoning:"],
@@ -39,11 +39,9 @@ spam_removal_task = Task(
         "Spam words to replace:\n{spam_words_to_replace}\n\n"
         
         "**Output Format**\n"
-        "```json\n"
-        "{\n"
-        "  \"refined_draft\": \"[BEGIN REFINED DRAFT]\\n(Your edited text here)\\n[END REFINED DRAFT]\"\n"
-        "}\n"
-        "```\n\n"
+        "[BEGIN REFINED DRAFT]\n"
+        "(Your edited text here)\n"
+        "[END REFINED DRAFT]"
 
         "**Output Sanitization Protocol:**\n"
         "- If ANY non-draft text emerges, REDACT COMPLETELY\n"
