@@ -3,7 +3,7 @@
 import pandas as pd
 import re
 import sqlite3 # Added for database access
-from campaign_stats import get_interspire_campaign_stats, get_mailwizz_campaign_stats
+from crewai_agent.old.campaign_stats import get_interspire_campaign_stats, get_mailwizz_campaign_stats
 
 class AgentRanking:
     def __init__(self):

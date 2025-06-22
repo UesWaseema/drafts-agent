@@ -1,7 +1,7 @@
 import schedule
 import time
 import logging
-from database_sync_pipeline import DatabaseSyncPipeline
+from crewai_agent.old.database_sync_pipeline import DatabaseSyncPipeline
 import os
 from dotenv import load_dotenv
 

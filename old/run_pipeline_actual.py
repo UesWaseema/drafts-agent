@@ -90,7 +90,7 @@ from common import (
 )
 from agent_draft_writer import draft_writer_agent, draft_task
 from agent_spam_removal import spam_removal_agent, spam_removal_task, final_output_sanitizer
-from agent_html_converter import html_converter_agent, html_conversion_task, html_output_sanitizer
+from crewai_agent.old.agent_html_converter import html_converter_agent, html_conversion_task, html_output_sanitizer
 from interspire_helpers import (
     get_recent_campaign_records,
     rows_to_json,

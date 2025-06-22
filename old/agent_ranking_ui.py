@@ -4,7 +4,7 @@ import mysql.connector
 import os
 from datetime import datetime, timedelta
 from agent_ranking import AgentRanking
-from database_sync_pipeline import get_campaign_count, get_last_sync_time # New import
+from crewai_agent.old.database_sync_pipeline import get_campaign_count, get_last_sync_time # New import
 
 st.set_page_config(layout="wide")
 
